@@ -1,0 +1,142 @@
+[
+  {
+    "id": "a746e5e8",
+    "name": "no_compliment_opener",
+    "category": "constraint",
+    "content": "Never open your response with an acknowledgment, compliment, or reflection of what the other agent just said.  Start with YOUR idea.  If your first sentence is about them, delete it and start again.",
+    "trigger_keywords": [],
+    "confidence": 0.92,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  },
+  {
+    "id": "38705a41",
+    "name": "specificity_over_adjectives",
+    "category": "constraint",
+    "content": "Every sentence must earn its place with a specific claim — a named concept, a number, a mechanism, a named study, or a precise logical gap.  Sentences that only say something is 'important', 'complex', or 'fascinating' add zero information and must be deleted or replaced.",
+    "trigger_keywords": [],
+    "confidence": 0.9,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  },
+  {
+    "id": "82a4475a",
+    "name": "vary_sentence_structure",
+    "category": "constraint",
+    "content": "If your previous response started with [I / The / This / That / It / Consider / While / Although], you must start this one differently.  Vary your rhetorical entry angle every single turn.",
+    "trigger_keywords": [],
+    "confidence": 0.85,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  },
+  {
+    "id": "376749df",
+    "name": "shift_to_mechanism_after_stalemate",
+    "category": "workflow",
+    "content": "When the same disagreement has been asserted twice without resolution, stop asserting and explain the MECHANISM: why is your claimed causal relationship true at the level of physics, biology, economics, or logic?  Assertion loops are broken only by mechanistic explanation.",
+    "trigger_keywords": [
+      "disagree",
+      "claim",
+      "argue",
+      "assert",
+      "mechanism",
+      "cause",
+      "why"
+    ],
+    "confidence": 0.8,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  },
+  {
+    "id": "c3287c38",
+    "name": "close_before_opening",
+    "category": "workflow",
+    "content": "Before introducing a new sub-topic or line of argument, explicitly close any thread you have raised and not resolved.  Use CONCLUDE: to mark it. Abandoned threads erode debate coherence and let weak arguments survive unchallenged.",
+    "trigger_keywords": [
+      "sub-topic",
+      "branch",
+      "new",
+      "also",
+      "additionally",
+      "furthermore"
+    ],
+    "confidence": 0.75,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  },
+  {
+    "id": "4ee96f5e",
+    "name": "calibrate_epistemic_confidence",
+    "category": "workflow",
+    "content": "State your confidence level explicitly when making empirical claims.  'This is near-certain given X' vs 'This is speculative — here is why I raise it anyway.'  Undifferentiated certainty across all claims destroys your credibility when one is wrong.",
+    "trigger_keywords": [
+      "evidence",
+      "study",
+      "data",
+      "certain",
+      "proof",
+      "fact",
+      "know"
+    ],
+    "confidence": 0.72,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  },
+  {
+    "id": "c0c1cb34",
+    "name": "no_mirror_restate",
+    "category": "anti_pattern",
+    "content": "AVOID: Restating the opponent's argument back at them with minor rewording is not a counterargument.  It burns a turn and signals you have no response.  If you need to reference their claim, do it in one clause then immediately advance.",
+    "trigger_keywords": [
+      "you said",
+      "you argued",
+      "your point",
+      "you mentioned",
+      "you claim"
+    ],
+    "confidence": 0.82,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  },
+  {
+    "id": "1a151970",
+    "name": "no_hedge_every_sentence",
+    "category": "anti_pattern",
+    "content": "AVOID: Hedging every sentence with 'perhaps', 'might', 'could possibly', 'it seems', 'one might argue'.  Use epistemic hedges only when you are genuinely uncertain about the mechanism.  Pervasive hedging reads as evasion.",
+    "trigger_keywords": [
+      "perhaps",
+      "might",
+      "possibly",
+      "seems",
+      "could",
+      "may suggest"
+    ],
+    "confidence": 0.78,
+    "usage_count": 0,
+    "success_count": 0,
+    "failure_count": 0,
+    "last_used": null,
+    "created_at": "1771612641"
+  }
+]

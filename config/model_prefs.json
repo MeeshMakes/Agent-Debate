@@ -1,0 +1,4 @@
+{
+  "left_model": "gemma3:27b",
+  "right_model": "qwen3:30b"
+}

@@ -1,0 +1,3 @@
+max_turns: 10
+drift_threshold: 2
+synthesis_interval: 6

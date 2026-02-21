@@ -1,0 +1,132 @@
+"""Debate quality scoring and echo detection.
+
+QualitySnapshot / DebateQuality — per-turn quality metrics (relevance, novelty, evidence).
+jaccard()         — token-set Jaccard similarity between two strings.
+detect_echo()     — catches an agent repeating itself across consecutive turns.
+detect_cross_echo() — catches both agents converging on the same vocabulary/framing.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+
+_TOKEN_RE = re.compile(r"[a-zA-Z0-9]{3,}")
+_ECHO_THRESHOLD_DEFAULT = 0.48
+_CROSS_ECHO_THRESHOLD_DEFAULT = 0.52
+
+# Common structural filler that inflates overlap scores — strip before comparison
+_STOPWORDS = frozenset({
+    "the", "and", "for", "that", "this", "with", "from", "are", "was", "were",
+    "been", "have", "has", "had", "not", "but", "its", "our", "your", "their",
+    "they", "them", "you", "she", "his", "her", "him", "who", "which", "what",
+    "when", "how", "can", "will", "would", "could", "should", "may", "might",
+    "also", "about", "into", "than", "then", "just", "only", "some", "more",
+    "most", "very", "much", "each", "every", "all", "any", "both", "few",
+    "such", "other", "over", "like", "one", "two", "three", "does", "did",
+    "use", "used", "using", "there", "here", "where", "these", "those",
+    "then", "even", "still", "itself", "itself",
+})
+
+
+def _tokenize(text: str) -> set[str]:
+    """Lower-cased content tokens, stopwords removed."""
+    return {
+        t.lower() for t in _TOKEN_RE.findall(text)
+        if t.lower() not in _STOPWORDS
+    }
+
+
+def jaccard(a: str, b: str) -> float:
+    """Jaccard similarity (0.0–1.0) between content-token sets of two strings."""
+    ta, tb = _tokenize(a), _tokenize(b)
+    if not ta and not tb:
+        return 1.0
+    union = ta | tb
+    if not union:
+        return 0.0
+    return len(ta & tb) / len(union)
+
+
+def detect_echo(
+    current: str,
+    previous_by_same_agent: list[str],
+    threshold: float = _ECHO_THRESHOLD_DEFAULT,
+) -> tuple[bool, float]:
+    """Detect whether *current* is vocabulary-echoing the agent's own recent messages.
+
+    Returns (is_echo, max_overlap_score).
+    Uses the LAST two messages from the same agent (if available).
+    """
+    if not previous_by_same_agent:
+        return False, 0.0
+
+    # Compare against last 2 messages from same agent to avoid false positives
+    check_against = previous_by_same_agent[-2:]
+    scores = [jaccard(current, prev) for prev in check_against]
+    max_score = max(scores, default=0.0)
+    return max_score >= threshold, round(max_score, 3)
+
+
+def detect_cross_echo(
+    msg_a: str,
+    msg_b: str,
+    threshold: float = _CROSS_ECHO_THRESHOLD_DEFAULT,
+) -> tuple[bool, float]:
+    """Detect whether two agents' messages are converging on the same vocabulary.
+
+    Returns (is_converging, overlap_score).
+    High overlap means both agents are circling the same conceptual territory —
+    a signal that the debate needs a forcing move.
+    """
+    score = jaccard(msg_a, msg_b)
+    return score >= threshold, round(score, 3)
+
+
+@dataclass
+class QualitySnapshot:
+    relevance: float
+    novelty: float
+    evidence: float
+    # Extended fields (always populated, default 0.0 for backward compat)
+    echo_score: float = 0.0       # self-echo overlap against recent own messages
+    cross_echo_score: float = 0.0 # cross-agent overlap (filled in by orchestrator)
+
+
+class DebateQuality:
+    def score(self, message: str, recent_messages: list[str]) -> QualitySnapshot:
+        msg_tokens = _tokenize(message)
+        if not msg_tokens:
+            return QualitySnapshot(0.0, 0.0, 0.0)
+
+        # Combine recent context for relevance / novelty
+        recent_tokens: set[str] = set()
+        for item in recent_messages[-6:]:
+            recent_tokens.update(_tokenize(item))
+
+        # Novelty: fraction of current-message tokens NOT in recent context
+        shared = len(msg_tokens & recent_tokens)
+        novelty = max(0.0, 1.0 - (shared / max(len(msg_tokens), 1)))
+
+        # Relevance: how much the message shares with recent context
+        # Capped at 1.0; floor of 0.4 since being on-topic is cheap
+        relevance = min(1.0, (shared / max(len(recent_tokens), 1)) + 0.40)
+
+        # Evidence: look for mechanistic / quantitative markers
+        evidence_strong = (
+            "study", "data", "evidence", "measured", "percent", "ratio",
+            "experiment", "published", "journal", "showed", "found",
+        )
+        evidence_weak = ("source", "according", "research", "suggests")
+        msg_lower = message.lower()
+        if any(m in msg_lower for m in evidence_strong):
+            evidence = 1.0
+        elif any(m in msg_lower for m in evidence_weak):
+            evidence = 0.65
+        else:
+            evidence = 0.35
+
+        return QualitySnapshot(
+            relevance=round(relevance, 2),
+            novelty=round(novelty, 2),
+            evidence=round(evidence, 2),
+        )
