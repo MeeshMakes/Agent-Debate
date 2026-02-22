@@ -175,6 +175,7 @@ class TurnPageWidget(QFrame):
     ) -> None:
         super().__init__(parent)
         self.msg_idx   = msg_idx
+        self.speaker   = speaker
         self._color    = agent_color
         self._bg       = bg_color
 
@@ -666,12 +667,13 @@ class CenterDebatePanel(QWidget):
         self._agent_map.clear()
         self._stack.setCurrentIndex(0)   # back to placeholder
 
-    def get_messages(self) -> list[dict]:
-        """Return a list of minimal message dicts (for compatibility)."""
-        return [
-            {"idx": p.msg_idx, "text": p._cleaned_text}
-            for p in self._pages
-        ]
+    def get_messages(self) -> list[tuple[str, str]]:
+        """Return messages as (agent_name, text) tuples in debate order.
+
+        This is the canonical format consumed by TTSPlaybackWorker and
+        capture utilities.
+        """
+        return [(p.speaker, p._cleaned_text) for p in self._pages]
 
     def set_follow_mode(self, enabled: bool) -> None:
         """No-op — the panel always follows TTS (kept for API compatibility)."""
