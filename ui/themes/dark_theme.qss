@@ -69,10 +69,11 @@ QTextEdit, QTextBrowser {
 }
 
 QTextBrowser#publicView {
-  background-color: #070e1c;
-  border: 1px solid #1e3050;
-  border-radius: 10px;
+  background-color: #060c18;
+  border: 2px solid #0e2240;
+  border-radius: 12px;
   font-size: 10.5pt;
+  padding: 6px;
 }
 
 QTextBrowser#astraPrivateView {

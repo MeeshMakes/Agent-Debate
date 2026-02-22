@@ -12,19 +12,28 @@ except ImportError:
 
 
 _DOC_STYLESHEET = (
-    "p { margin: 2px 0; } "
-    "code { font-family: Consolas, 'Courier New', monospace; "
-    "background-color: #0d1b2a; color: #80cbc4; font-size: 9pt; } "
+    "body { margin: 0; padding: 0; } "
+    "p { margin: 4px 0; line-height: 170%; } "
+    "code { font-family: 'Cascadia Code', Consolas, 'Courier New', monospace; "
+    "background-color: #0d1b2a; color: #80cbc4; font-size: 9.5pt; "
+    "padding: 1px 5px; } "
     "pre { background-color: #0a1520; color: #a8e6cf; "
-    "font-family: Consolas, 'Courier New', monospace; "
-    "font-size: 9pt; padding: 8px; margin: 4px 0; "
-    "border-left: 3px solid #00bcd4; } "
-    "blockquote { color: #90a4ae; margin-left: 8px; padding-left: 8px; } "
-    "strong { color: #e0e6ff; } "
-    "em { color: #b0bec5; } "
-    "a { color: #64b5f6; } "
-    "li { color: #e8eef9; margin: 1px 0; } "
-    "h1, h2, h3 { color: #a0cfff; margin: 4px 0 2px 0; } "
+    "font-family: 'Cascadia Code', Consolas, 'Courier New', monospace; "
+    "font-size: 9.5pt; padding: 10px 14px; margin: 6px 0; "
+    "border-left: 3px solid #00bcd4; line-height: 150%; } "
+    "blockquote { color: #b0bec5; margin-left: 12px; padding-left: 12px; "
+    "border-left: 2px solid #37474f; font-style: italic; } "
+    "strong { color: #e8f0ff; } "
+    "em { color: #b8c9d9; font-style: italic; } "
+    "a { color: #64b5f6; text-decoration: none; } "
+    "li { color: #e8eef9; margin: 2px 0; line-height: 160%; } "
+    "ul, ol { margin: 4px 0 4px 16px; } "
+    "h1 { color: #a0cfff; font-size: 13pt; margin: 8px 0 4px 0; } "
+    "h2 { color: #a0cfff; font-size: 12pt; margin: 6px 0 4px 0; } "
+    "h3 { color: #90b8e0; font-size: 11pt; margin: 4px 0 2px 0; } "
+    "table { border-collapse: collapse; margin: 4px 0; } "
+    "td, th { padding: 4px 8px; border: 1px solid #2a3a55; } "
+    "th { background-color: #0f1e35; color: #80cbc4; font-weight: 700; } "
 )
 
 
@@ -53,6 +62,20 @@ AGENT_COLORS = {
     "Nova": "#ff6e40",        # deep orange
     "Arbiter": "#ffd740",     # amber
     "Resolution": "#69f0ae",  # green
+}
+
+AGENT_ICONS = {
+    "Astra": "\u25C6",       # ◆ diamond
+    "Nova": "\u25CF",        # ● circle
+    "Arbiter": "\u25B2",     # ▲ triangle
+    "Resolution": "\u2726", # ✦ star
+}
+
+AGENT_CARD_BG = {
+    "Astra": "#0a1525",
+    "Nova": "#150f0a",
+    "Arbiter": "#14120a",
+    "Resolution": "#0a1510",
 }
 
 _TTS_HIGHLIGHT_BG = QColor("#e65100")   # deep orange
@@ -84,10 +107,10 @@ class CenterDebatePanel(QWidget):
         header_row.setContentsMargins(0, 0, 0, 0)
         header_row.setSpacing(8)
 
-        self._header = QLabel("LIVE DEBATE STREAM")
+        self._header = QLabel("\u25B8 LIVE DEBATE STREAM")
         self._header.setStyleSheet(
-            "font-size: 13pt; font-weight: 700; color: #a0cfff; "
-            "padding: 6px 0; letter-spacing: 2px;"
+            "font-size: 14pt; font-weight: 900; color: #c0e0ff; "
+            "padding: 8px 0; letter-spacing: 3px;"
         )
         header_row.addWidget(self._header)
         header_row.addStretch()
@@ -116,6 +139,8 @@ class CenterDebatePanel(QWidget):
 
         # Last talking point shown — used to suppress repetition in the feed
         self._last_talking_point: str = ""
+        # Running message counter for card numbering
+        self._msg_count: int = 0
 
         # Store messages for TTS playback
         self._messages: list[tuple[str, str]] = []
@@ -181,6 +206,7 @@ class CenterDebatePanel(QWidget):
         self._word_cursor = None
         self._word_cursor_fmt = None
         self._last_tts_char_offset = -1
+        self._msg_count = 0
         self._turn_indicator.setText("")
 
     def update_turn_indicator(self, speaker: str, turn: int, total_turns: int = 0) -> None:
@@ -218,77 +244,90 @@ class CenterDebatePanel(QWidget):
         reframe: str | None = None,
     ) -> None:
         color = AGENT_COLORS.get(speaker, "#e0e0e0")
+        icon = AGENT_ICONS.get(speaker, "\u25CF")
+        card_bg = AGENT_CARD_BG.get(speaker, "#0c1422")
         self._messages.append((speaker, text))
         self._cleaned_texts.append(TTSPlaybackWorker.clean_text(text))
         self._clean_to_doc_maps.append(None)
+        self._msg_count += 1
+        msg_num = self._msg_count
 
-        # --- Build full HTML for the message block ---
-
-        # Talking point badge — only render when the talking point changes
+        # ── Talking-point badge (shown only when it changes) ──
         tp_html = ""
         if talking_point and talking_point != self._last_talking_point:
             self._last_talking_point = talking_point
             tp_html = (
-                f"<div style='margin-bottom:3px;'>"
-                f"<span style='color:rgba(96,160,152,0.8); font-size:9pt; font-style:italic;'>"
-                f"▸ {escape(talking_point)}</span></div>"
+                f"<div style='margin:0 0 6px 0; padding:3px 10px; "
+                f"border-left:2px solid #4a6a6a;'>"
+                f"<span style='color:#6a9e98; font-size:9pt; font-style:italic; "
+                f"font-family:Segoe UI,sans-serif;'>"
+                f"\u25b8 {escape(talking_point)}</span></div>"
             )
 
-        # Agent name badge with optional quality score indicator
-        score_badge_html = ""
+        # ── Quality indicator ──
+        score_badge = ""
         if quality:
             q_composite = round(
-                (quality.get("relevance", 0.0) + quality.get("novelty", 0.0) + quality.get("evidence", 0.0)) / 3,
-                2,
+                (quality.get("relevance", 0.0) + quality.get("novelty", 0.0)
+                 + quality.get("evidence", 0.0)) / 3, 2,
             )
             if q_composite >= 0.65:
-                badge_bg = "#1b5e20"
-                badge_fg = "#a5d6a7"
-                dot = "🟢"
+                badge_color, dot = "#69f0ae", "\u25B2"
             elif q_composite >= 0.45:
-                badge_bg = "#e65100"
-                badge_fg = "#ffcc80"
-                dot = "🟡"
+                badge_color, dot = "#ffd740", "\u25CF"
             else:
-                badge_bg = "#7f0000"
-                badge_fg = "#ef9a9a"
-                dot = "🔴"
-            score_badge_html = (
-                f"<span style='background:{badge_bg}; color:{badge_fg}; "
-                f"font-size:8pt; padding:1px 7px; border-radius:3px; margin-left:6px;'>"
+                badge_color, dot = "#ef5350", "\u25BC"
+            score_badge = (
+                f"<span style='color:{badge_color}; font-size:8.5pt; "
+                f"font-weight:700; margin-left:8px;'>"
                 f"{dot} {q_composite:.2f}</span>"
             )
-        model_tag_html = ""
+
+        # ── Model tag ──
+        model_tag = ""
         if model_name:
-            model_tag_html = (
-                f"<span style='color:#546e7a; font-size:8pt; "
-                f"font-style:italic; margin-left:6px; "
-                f"vertical-align:middle;'>{escape(model_name)}</span>"
+            model_tag = (
+                f"<span style='color:#455a64; font-size:8pt; "
+                f"font-style:italic; margin-left:8px;'>"
+                f"{escape(model_name)}</span>"
             )
-        name_html = (
-            f"<span style='"
-            f"background-color:{color}; color:#0b0f16; "
-            f"font-weight:800; padding:3px 18px; border-radius:20px; "
-            f"font-size:13pt; letter-spacing:0.3px; "
-            f"font-family:'Segoe UI',system-ui,sans-serif;'>{escape(speaker)}</span>"
-            f"{model_tag_html}"
-            f"{score_badge_html}"
+
+        # ── Agent header: icon + name + msg number + badges ──
+        header_html = (
+            f"<div style='margin-bottom:6px;'>"
+            f"<span style='color:{color}; font-size:15pt; font-weight:900; "
+            f"letter-spacing:1.2px; "
+            f"font-family:Segoe UI,system-ui,sans-serif;'>"
+            f"{icon} {escape(speaker).upper()}</span>"
+            f"<span style='color:#2a3a55; font-size:9pt; font-weight:600; "
+            f"margin-left:10px; letter-spacing:0.5px;'>#{msg_num}</span>"
+            f"{model_tag}{score_badge}"
+            f"</div>"
         )
 
-        # Evidence score
+        # ── Thin accent separator under the header ──
+        sep_html = (
+            f"<div style='border-top:1px solid {color}40; "
+            f"margin:0 0 8px 0;'></div>"
+        )
+
+        # ── Evidence score ──
         ev_html = ""
         if evidence_score is not None and evidence_score > 0:
             ev_html = (
-                f"<div style='margin-top:2px;'>"
-                f"<span style='color:#78909c; font-size:8pt; margin-left:12px;'>"
-                f"Evidence score: {evidence_score:.3f}</span></div>"
+                f"<div style='margin-top:6px;'>"
+                f"<span style='color:#546e7a; font-size:8pt;'>"
+                f"Evidence: {evidence_score:.3f}</span></div>"
             )
 
-        # Citations
+        # ── Citations ──
         cit_html = ""
         if citations:
-            lines = ["<div style='margin-top:2px;'>"
-                     "<span style='color:#78909c; font-size:8pt; margin-left:12px;'>Sources:</span>"]
+            lines = [
+                "<div style='margin-top:6px;'>"
+                "<span style='color:#546e7a; font-size:8pt; "
+                "font-weight:600;'>Sources</span>"
+            ]
             for i, citation in enumerate(citations, start=1):
                 source_path = str(citation.get("source_path", "")).replace("\\", "/")
                 href = f"source:///{quote(source_path, safe='/:._-')}"
@@ -296,72 +335,79 @@ class CenterDebatePanel(QWidget):
                 display_source = escape(str(citation.get("source", "")))
                 score = float(citation.get("score", 0.0))
                 lines.append(
-                    f"<br><span style='color:#78909c; font-size:8pt; margin-left:16px;'>"
-                    f"[{i}] {title} | score={score:.3f} | "
-                    f"<a href='{href}' style='color:#64b5f6;'>{display_source}</a></span>"
+                    f"<br><span style='color:#546e7a; font-size:8pt;'>"
+                    f"[{i}] {title} ({score:.3f}) "
+                    f"<a href='{href}' style='color:#64b5f6;'>{display_source}</a>"
+                    f"</span>"
                 )
             lines.append("</div>")
             cit_html = "".join(lines)
 
-        # Reframe card — creative second pass, shown beneath the main response
+        # ── Reframe card ──
         reframe_html = ""
         if reframe:
-            # Choose a soft accent that complements the agent colour without clashing
             agent_low = speaker.lower()
             if agent_low == "astra":
-                reframe_border = "#80cbc4"   # soft teal
-                reframe_label_color = "#80cbc4"
+                rf_border, rf_label = "#80cbc4", "#80cbc4"
             elif agent_low == "nova":
-                reframe_border = "#ffab91"   # soft coral
-                reframe_label_color = "#ffab91"
+                rf_border, rf_label = "#ffab91", "#ffab91"
             else:
-                reframe_border = "#b39ddb"   # lavender default
-                reframe_label_color = "#b39ddb"
+                rf_border, rf_label = "#b39ddb", "#b39ddb"
             reframe_html = (
                 f"<div style='"
-                f"margin:8px 0 0 10px;"
-                f"border-left:3px solid {reframe_border};"
-                f"border-radius:0 8px 8px 0;"
-                f"background:#12102a;"
-                f"padding:6px 12px 8px 14px;"
-                f"'>"
-                f"<span style='"
-                f"color:{reframe_label_color}; font-size:8pt; font-weight:700;"
-                f"letter-spacing:0.4px; font-family:'Segoe UI',system-ui,sans-serif;"
-                f"'>&#10022; Reframe</span>"
-                f"<div style='"
-                f"color:#c5cae9; font-size:9.5pt; font-style:italic;"
-                f"font-family:'Georgia','Palatino Linotype',serif;"
-                f"line-height:1.65; margin-top:4px;"
-                f"'>{_md_to_html(reframe)}</div>"
-                f"</div>"
+                f"margin:10px 0 0 0; "
+                f"border-left:3px solid {rf_border}; "
+                f"background:#10101e; "
+                f"padding:8px 14px 10px 14px;'>"
+                f"<span style='color:{rf_label}; font-size:8.5pt; font-weight:700; "
+                f"letter-spacing:0.5px;'>\u2726 Reframe</span>"
+                f"<div style='color:#c5cae9; font-size:9.5pt; font-style:italic; "
+                f"font-family:Georgia,Palatino Linotype,serif; "
+                f"line-height:1.7; margin-top:4px;'>"
+                f"{_md_to_html(reframe)}</div></div>"
             )
 
+        # ── Body text — rendered Markdown ──
+        body_html = (
+            f"<div style='color:#e0e8f8; font-size:10.5pt; line-height:1.8; "
+            f"font-family:Segoe UI,system-ui,sans-serif; "
+            f"letter-spacing:0.15px;'>"
+            f"{_md_to_html(text)}</div>"
+        )
+
+        # ══════════════════════════════════════════════════════
+        #  Assemble the full card
+        # ══════════════════════════════════════════════════════
         full_html = (
-            f"<div style='margin:8px 0 2px 0;'>"
+            f"<div style='"
+            f"margin:14px 6px 6px 6px; "
+            f"border-left:4px solid {color}; "
+            f"background:{card_bg}; "
+            f"padding:14px 18px 12px 16px;'>"
             f"{tp_html}"
-            f"{name_html}"
-            f"<div style='color:#e8eef9; margin:6px 0 0 10px; "
-            f"line-height:1.6; font-size:10pt; "
-            f"font-family:\'Segoe UI\',system-ui,sans-serif;'>{_md_to_html(text)}</div>"
+            f"{header_html}"
+            f"{sep_html}"
+            f"{body_html}"
             f"{reframe_html}"
             f"{ev_html}"
             f"{cit_html}"
             f"</div>"
-            f"<hr style='border:none; border-top:1px solid #2a3a55; margin:10px 0;'/>"
         )
 
-        # --- Record document positions before and after this single append ---
+        # ── Record document positions and append ──
         doc = self.public_view.document()
         start_pos = doc.characterCount()
 
-        # Preserve scroll position so append() doesn't bounce the viewport.
-        # QTextBrowser.append() always scrolls to the end; we undo that here.
         vbar = self.public_view.verticalScrollBar()
         saved_scroll = vbar.value()
         self.public_view.append(full_html)
-        # Restore position — prevents the jarring bounce when new messages arrive
-        vbar.setValue(saved_scroll)
+
+        # Follow mode: scroll to bottom to track new content.
+        # Otherwise: preserve user's scroll position.
+        if self._follow_mode:
+            vbar.setValue(vbar.maximum())
+        else:
+            vbar.setValue(saved_scroll)
 
         end_pos = doc.characterCount()
         self._message_positions.append((start_pos, end_pos))
