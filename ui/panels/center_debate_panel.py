@@ -31,8 +31,9 @@ from html import escape
 from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor, QTextOption
 from PyQt6.QtWidgets import (
+    QAbstractScrollArea,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -63,6 +64,10 @@ class LockedTextBrowser(QTextBrowser):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
+        self.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
         self._lock_scroll   = True      # viewport frozen by default
         self._paging        = False     # True only during our own page jump
         self._last_cur: Optional[QTextCursor] = None
@@ -218,10 +223,14 @@ class TurnPageWidget(QFrame):
         hl = QHBoxLayout(header)
         hl.setContentsMargins(18, 0, 18, 0)
 
+        speaker_for_header = speaker.strip().upper()
+        if len(speaker_for_header) > 56:
+            speaker_for_header = speaker_for_header[:55] + "…"
+
         icon     = "\u25c6" if "astra" in speaker.lower() else "\u25cf"
         spk_lbl  = QLabel(
             f"<span style='color:{color}; font-size:13pt; font-weight:900; "
-            f"letter-spacing:2px;'>{icon} {escape(speaker).upper()}</span>"
+            f"letter-spacing:2px;'>{icon} {escape(speaker_for_header)}</span>"
         )
         spk_lbl.setTextFormat(Qt.TextFormat.RichText)
         hl.addWidget(spk_lbl)
@@ -481,6 +490,12 @@ class TurnPageWidget(QFrame):
     def clear_highlight(self) -> None:
         self._body.clear_highlight()
 
+    def reset_tts_view(self) -> None:
+        """Reset this turn page to top-of-text for a fresh TTS pass."""
+        self._body.clear_highlight()
+        vb = self._body.verticalScrollBar()
+        vb.setValue(0)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  CenterDebatePanel — public-facing widget used by main_window.py
@@ -529,6 +544,7 @@ class CenterDebatePanel(QWidget):
         self._total_turns: int                  = 0
         self._source_cb:   Optional[Callable]   = None
         self._view_locked: bool                  = False
+        self._last_tts_msg_idx: int              = -1
 
         self._setup_ui()
 
@@ -610,8 +626,27 @@ class CenterDebatePanel(QWidget):
 
         first = str(args[0])
         second = str(args[1])
-        if first.strip().lower() in {"astra", "nova"}:
+
+        known_speakers = {
+            "astra",
+            "nova",
+            "arbiter",
+            "resolution",
+            "system",
+            "moderator",
+            "crowd",
+        }
+        first_clean = first.strip()
+        second_clean = second.strip()
+
+        if first_clean.lower() in known_speakers:
             agent_name, text = first, second
+        elif second_clean.lower() in known_speakers:
+            text, agent_name = first, second
+        elif len(first_clean) <= 40 and "\n" not in first_clean and (len(second_clean) > 40 or "\n" in second_clean):
+            agent_name, text = first, second
+        elif len(second_clean) <= 40 and "\n" not in second_clean and (len(first_clean) > 40 or "\n" in first_clean):
+            text, agent_name = first, second
         else:
             text, agent_name = first, second
 
@@ -654,13 +689,43 @@ class CenterDebatePanel(QWidget):
         setPlainText(), so it maps directly to document position.
         """
         if 0 <= msg_idx < len(self._pages):
+            target_page = self._pages[msg_idx]
+            if self._stack.currentWidget() is not target_page:
+                self._stack.setCurrentWidget(target_page)
+
+            if self._last_tts_msg_idx != -1 and self._last_tts_msg_idx != msg_idx:
+                if 0 <= self._last_tts_msg_idx < len(self._pages):
+                    self._pages[self._last_tts_msg_idx].clear_highlight()
+
             self._pages[msg_idx].highlight_word(char_offset, word_len)
+            self._last_tts_msg_idx = msg_idx
 
     def clear_highlight(self) -> None:
         """Clear any active TTS word highlight."""
-        page = self._current_page()
-        if page:
-            page.clear_highlight()
+        if 0 <= self._last_tts_msg_idx < len(self._pages):
+            self._pages[self._last_tts_msg_idx].clear_highlight()
+        else:
+            page = self._current_page()
+            if page:
+                page.clear_highlight()
+        self._last_tts_msg_idx = -1
+
+    def begin_tts_follow(self) -> None:
+        """Prepare all turn pages for a full from-top TTS playback pass."""
+        self._last_tts_msg_idx = -1
+        for page in self._pages:
+            page.reset_tts_view()
+
+    def focus_message_for_tts(self, msg_idx: int) -> None:
+        """Force center panel to the currently spoken turn during TTS."""
+        if not (0 <= msg_idx < len(self._pages)):
+            return
+        target_page = self._pages[msg_idx]
+        if self._stack.currentWidget() is not target_page:
+            self._stack.setCurrentWidget(target_page)
+        if self._last_tts_msg_idx != msg_idx:
+            target_page.reset_tts_view()
+            self._last_tts_msg_idx = msg_idx
 
     def clear_messages(self) -> None:
         """Remove all turn pages."""

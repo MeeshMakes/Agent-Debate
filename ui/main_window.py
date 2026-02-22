@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtGui import QGuiApplication, QWheelEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -463,6 +463,25 @@ class MainWindow(QMainWindow):
         # Default: semantic awareness ON — agents recall past debate sessions
         self._semantic_btn.setChecked(True)  # fires _on_semantic_toggled(True) via bound signal
         self._status_bar.showMessage("Ready — select a topic and start the debate")
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        if self.isMaximized() or self.isFullScreen():
+            return
+        try:
+            screen = self.windowHandle().screen() if self.windowHandle() else None
+            if screen is None:
+                screen = QGuiApplication.screenAt(self.frameGeometry().center())
+            if screen is None:
+                screen = QGuiApplication.primaryScreen()
+            if screen is None:
+                return
+
+            max_width = max(1200, int(screen.availableGeometry().width() * 1.05))
+            if self.width() > max_width:
+                self.resize(max_width, self.height())
+        except Exception:
+            return
 
     # ------------------------------------------------------------------ layout
 
@@ -1393,9 +1412,8 @@ class MainWindow(QMainWindow):
             lines.append("Deleted: " + ", ".join(deleted))
         short_msg = " | ".join(lines)
 
-        self.center_panel.append_message(
-            "Repo Watchdog",
-            f"Repository changes detected during debate. {short_msg}\n\n{change_brief}",
+        self._status_bar.showMessage(
+            f"Repo Watchdog: detected changes — {short_msg}", 8000
         )
         if self.orchestrator is not None:
             self.orchestrator.inject_arbiter_message(
@@ -1709,6 +1727,7 @@ class MainWindow(QMainWindow):
         self._tts_worker = TTSPlaybackWorker(self)
         self._tts_worker.load_messages(messages, start_index=0)
         self._tts_worker.set_rate(self._speed_slider.value())
+        self.center_panel.begin_tts_follow()
         self.center_panel.set_view_locked(True)
         self._tts_worker.now_speaking.connect(self._on_tts_now_speaking)
         self._tts_worker.word_at.connect(
@@ -1746,6 +1765,7 @@ class MainWindow(QMainWindow):
 
     def _on_tts_now_speaking(self, idx: int, agent: str) -> None:
         self._current_speaking_idx = idx
+        self.center_panel.focus_message_for_tts(idx)
         self._status_bar.showMessage(f"🔊 Reading [{idx + 1}] {agent}...")
 
     def _on_tts_done(self) -> None:
@@ -2004,11 +2024,9 @@ class MainWindow(QMainWindow):
 
         elif event.event_type == "arbiter_injection":
             msg = event.payload.get("message", "")
-            self.center_panel.append_message(
-                "Arbiter",
-                f"💬 CROWD INJECTION: {msg}",
-            )
-            self.arbiter_panel.set_message(f"💬 Injected: {msg[:80]}")
+            preview = msg if len(msg) <= 180 else (msg[:177] + "...")
+            self.arbiter_panel.set_message(f"💬 Injected: {preview}")
+            self._status_bar.showMessage("Crowd injection received and routed to Arbiter panel", 6000)
 
         elif event.event_type == "resolution":
             # Capture for TopicRefineWorker after session ends
