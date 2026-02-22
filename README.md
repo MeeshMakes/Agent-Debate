@@ -116,6 +116,7 @@ For repository analysis:
 If you want model packs, tuning details, and runtime notes, see:
 
 - `LOCAL_MODELS.md`
+- `docs/SMOKE_TEST_SCREENSHOTS.md` (UI smoke-test screenshot gallery)
 
 ---
 
