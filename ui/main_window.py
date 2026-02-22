@@ -1697,6 +1697,7 @@ class MainWindow(QMainWindow):
         if not messages:
             self._status_bar.showMessage("No messages to read yet — start a debate first")
             self._set_tts_button_playing(False)
+            self.center_panel.set_view_locked(False)
             return
 
         # Kill any lingering worker
@@ -1708,10 +1709,8 @@ class MainWindow(QMainWindow):
         self._tts_worker = TTSPlaybackWorker(self)
         self._tts_worker.load_messages(messages, start_index=0)
         self._tts_worker.set_rate(self._speed_slider.value())
+        self.center_panel.set_view_locked(True)
         self._tts_worker.now_speaking.connect(self._on_tts_now_speaking)
-        self._tts_worker.now_speaking.connect(
-            lambda idx, _agent: self.center_panel.highlight_message(idx)
-        )
         self._tts_worker.word_at.connect(
             lambda idx, offset, length: self.center_panel.highlight_word(idx, offset, length)
         )
@@ -1740,6 +1739,7 @@ class MainWindow(QMainWindow):
             self._tts_worker.wait(1500)
             self._tts_worker = None
         self.center_panel.clear_highlight()
+        self.center_panel.set_view_locked(False)
         self._set_tts_button_playing(False)
         self._current_speaking_idx = -1
         self._status_bar.showMessage("TTS stopped")
@@ -1750,11 +1750,13 @@ class MainWindow(QMainWindow):
 
     def _on_tts_done(self) -> None:
         self.center_panel.clear_highlight()
+        self.center_panel.set_view_locked(False)
         self._set_tts_button_playing(False)
         self._status_bar.showMessage("TTS finished reading all messages")
 
     def _on_tts_error(self, msg: str) -> None:
         self.center_panel.clear_highlight()
+        self.center_panel.set_view_locked(False)
         self._set_tts_button_playing(False)
         self._status_bar.showMessage(f"TTS error: {msg}")
 

@@ -528,6 +528,7 @@ class CenterDebatePanel(QWidget):
         self._agent_map:   dict[str, int]       = {}   # name → color index
         self._total_turns: int                  = 0
         self._source_cb:   Optional[Callable]   = None
+        self._view_locked: bool                  = False
 
         self._setup_ui()
 
@@ -635,11 +636,14 @@ class CenterDebatePanel(QWidget):
 
         self._pages.append(page)
         self._stack.addWidget(page)
-        self._stack.setCurrentWidget(page)   # auto-advance to newest
+        if not self._view_locked:
+            self._stack.setCurrentWidget(page)   # auto-advance to newest
         return msg_idx
 
     def highlight_message(self, msg_idx: int) -> None:
         """Flip the stack to the page for msg_idx (called by now_speaking)."""
+        if self._view_locked:
+            return
         if 0 <= msg_idx < len(self._pages):
             self._stack.setCurrentWidget(self._pages[msg_idx])
 
@@ -679,6 +683,14 @@ class CenterDebatePanel(QWidget):
         """No-op — the panel always follows TTS (kept for API compatibility)."""
         # Emit so any connected slots still receive the signal
         self.follow_mode_changed.emit(True)
+
+    def set_view_locked(self, locked: bool) -> None:
+        """Lock/unlock page switching in the center panel.
+
+        When locked, both auto-advance on new messages and explicit page flips
+        from highlight_message() are ignored, preserving the current view.
+        """
+        self._view_locked = bool(locked)
 
     def update_turn_indicator(self, *args) -> None:
         """Update top-bar turn counter.
