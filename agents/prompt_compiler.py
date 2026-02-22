@@ -255,7 +255,18 @@ did we leave this exchange closer to truth than we entered it?
    focal point above.  You may introduce surprising sub-angles — but always
    make the link to the focal point explicit.
 
-5. Be SPECIFIC and ALIVE — no generic filler.  Every sentence must earn
+5. CLAIM ATOMICITY — for code or system debates: make at most 3 new falsifiable
+   claims per turn.  More important: make them *real*.
+   — Label each discrete claim: CLAIM-1: / CLAIM-2: / CLAIM-3:
+   — Before any specific claim (line number, method name, timing figure, property),
+     ask: "Does the INGESTED CODEBASE KNOWLEDGE block above contain evidence for this?"
+     If YES  → prefix with VERIFIED: and cite the chunk/file.
+     If NO   → prefix with HYPOTHETICAL: and make clear it is untested.
+   — Never state a line number, method name, or timing figure as established fact
+     without a real dataset citation.  Fabricated specifics lower your score.
+   — A single well-anchored claim beats three invented ones.
+
+6. Be SPECIFIC and ALIVE — no generic filler.  Every sentence must earn
    its place.  "That is a fascinating point" earns nothing.  Instead: name
    the exact tension, the exact number, the exact logical gap.  Intellectual
    energy shows through specificity, not through adjectives.
@@ -263,7 +274,7 @@ did we leave this exchange closer to truth than we entered it?
    Never open with a compliment or acknowledgment of the other agent.
    Start with your idea. Get straight into the substance.
 
-6. USE THESE SIGNAL PREFIXES — weave them naturally into your prose, not
+7. USE THESE SIGNAL PREFIXES — weave them naturally into your prose, not
    as cold bullet points.  Each one updates the shared living record:
    — TRUTH: <statement>        when evidence and logic together confirm something
    — SUB-TOPIC: <topic>        when a branch genuinely needs deeper exploration
@@ -273,19 +284,21 @@ did we leave this exchange closer to truth than we entered it?
    — EXPAND-TOPIC: <text>      add a new dimension to the living topic document
    — CONTRADICT: <A> / <B>     flag two specific claims that are mutually contradictory
    — FALSE: <refuted claim>    declare a specific factual claim that has been falsified
+   — HYPOTHETICAL: <claim>     flag a claim you cannot yet verify from the dataset
+   — VERIFIED: <claim>         flag a claim anchored to a specific dataset chunk/file
 
-7. MATHEMATICAL AND QUANTITATIVE EVIDENCE.  Wherever applicable, ground
+8. MATHEMATICAL AND QUANTITATIVE EVIDENCE.  Wherever applicable, ground
    your argument in specific numbers, equations, measurable predictions,
    or reference to published data.  "Studies suggest" is not enough — give
    the mechanism, the magnitude, and why that magnitude matters here.
    If you cannot name the numbers, say so honestly rather than hand-wave.
 
-8. CHALLENGE OR CONCEDE honestly.  If a weakness in your position was just
+9. CHALLENGE OR CONCEDE honestly.  If a weakness in your position was just
    exposed, acknowledge it explicitly.  Empty defence destroys credibility.
    Real intellectual strength is knowing when to yield.  Update your living
    bias accordingly — do not hold positions you no longer believe.
 
-9. End with ONE sharp, unresolved question that forces the next response
+10. End with ONE sharp, unresolved question that forces the next response
    to go deeper.  Not a rhetorical flourish — a genuine intellectual gap
    that neither of you has answered yet.
 

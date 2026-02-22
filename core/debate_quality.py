@@ -4,6 +4,15 @@ QualitySnapshot / DebateQuality — per-turn quality metrics (relevance, novelty
 jaccard()         — token-set Jaccard similarity between two strings.
 detect_echo()     — catches an agent repeating itself across consecutive turns.
 detect_cross_echo() — catches both agents converging on the same vocabulary/framing.
+
+Evidence scoring tiers (highest to lowest):
+  1.0  — repo-grounded: file:line citation (e.g. trainer.py#42) or VERIFIED: claim
+  0.85 — dataset reference: chunk index citation or INGESTED CODEBASE KNOWLEDGE reference
+  0.65 — external: published study, measured data, named experiment with mechanism
+  0.40 — weak: vague "research shows", "studies suggest", unnamed sources
+  0.15 — bare number: precise figures (X.X seconds, line NNN) with no file anchor
+         — signals hallucination; penalised to discourage fabricated specificity
+  0.20 — baseline: no evidence markers
 """
 from __future__ import annotations
 
@@ -13,6 +22,30 @@ from dataclasses import dataclass
 _TOKEN_RE = re.compile(r"[a-zA-Z0-9]{3,}")
 _ECHO_THRESHOLD_DEFAULT = 0.48
 _CROSS_ECHO_THRESHOLD_DEFAULT = 0.52
+
+# Detect real repo/dataset citations: e.g. "trainer.py#42", "trainer.py line 42",
+# "[src/trainer.py#0]", VERIFIED: prefix, or chunk-index notation
+_CODE_CITATION_RE = re.compile(
+    r'(?:'
+    r'\b\w[\w/]+\.py\s*(?:#\s*\d+|line\s+\d+)'  # file.py#N or file.py line N
+    r'|'
+    r'\[[\w/.]+\.py#\d+\]'                         # [path/file.py#N]
+    r'|'
+    r'\bVERIFIED\s*:'                              # VERIFIED: prefix
+    r'|'
+    r'\bingested\s+codebase\b'                     # references the dataset block
+    r')',
+    re.IGNORECASE,
+)
+
+# Detect bare invented specificity: exact numbers attached to time/size/line
+# WITHOUT any accompanying file reference on the same line
+_BARE_NUMBER_RE = re.compile(
+    r'\b\d+\.?\d*\s*(?:seconds?|milliseconds?|ms|percent|%)\b'
+    r'|\bline\s+\d{2,}\b'      # "line 142" without a file
+    r'|\bIEEE\s+\d{4}\b',      # fake standards numbers
+    re.IGNORECASE,
+)
 
 # Common structural filler that inflates overlap scores — strip before comparison
 _STOPWORDS = frozenset({
@@ -111,19 +144,28 @@ class DebateQuality:
         # Capped at 1.0; floor of 0.4 since being on-topic is cheap
         relevance = min(1.0, (shared / max(len(recent_tokens), 1)) + 0.40)
 
-        # Evidence: look for mechanistic / quantitative markers
-        evidence_strong = (
-            "study", "data", "evidence", "measured", "percent", "ratio",
-            "experiment", "published", "journal", "showed", "found",
-        )
-        evidence_weak = ("source", "according", "research", "suggests")
+        # Evidence: tiered scoring
         msg_lower = message.lower()
-        if any(m in msg_lower for m in evidence_strong):
+        # Tier 1 — real repo/dataset citation
+        if _CODE_CITATION_RE.search(message):
             evidence = 1.0
-        elif any(m in msg_lower for m in evidence_weak):
-            evidence = 0.65
+        # Tier 2 — strong external evidence with mechanism
+        elif any(m in msg_lower for m in (
+            "study", "data", "measured", "experiment", "published", "journal",
+            "showed", "found", "ratio", "benchmark",
+        )):
+            # Bump if it feels anchored; shrink if there's also bare invented specificity
+            has_bare = bool(_BARE_NUMBER_RE.search(message))
+            evidence = 0.55 if has_bare else 0.85
+        # Tier 3 — weak external
+        elif any(m in msg_lower for m in ("source", "according", "research", "suggests", "percent", "evidence")):
+            has_bare = bool(_BARE_NUMBER_RE.search(message))
+            evidence = 0.25 if has_bare else 0.55
+        # Tier 4 — bare number with no source (hallucination signal)
+        elif _BARE_NUMBER_RE.search(message):
+            evidence = 0.15
         else:
-            evidence = 0.35
+            evidence = 0.20
 
         return QualitySnapshot(
             relevance=round(relevance, 2),

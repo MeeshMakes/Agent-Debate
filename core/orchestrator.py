@@ -171,6 +171,28 @@ class DebateOrchestrator:
             },
         )
 
+    def _extract_verified(self, message: str) -> list[str]:
+        """Pull VERIFIED: claims — dataset-anchored assertions."""
+        found = []
+        for line in message.split("\n"):
+            s = line.strip()
+            if s.upper().startswith("VERIFIED:"):
+                txt = s[9:].strip()
+                if txt:
+                    found.append(txt)
+        return found
+
+    def _extract_hypothetical(self, message: str) -> list[str]:
+        """Pull HYPOTHETICAL: claims — unverified but declared as such."""
+        found = []
+        for line in message.split("\n"):
+            s = line.strip()
+            if s.upper().startswith("HYPOTHETICAL:"):
+                txt = s[13:].strip()
+                if txt:
+                    found.append(txt)
+        return found
+
     def _extract_sub_topics(self, message: str) -> list[str]:
         """Pull SUB-TOPIC: lines from agent response."""
         found = []
@@ -404,6 +426,25 @@ class DebateOrchestrator:
                 contradictions  = self._extract_contradict(message)
                 falsehoods      = self._extract_false(message)
                 expansions      = self._extract_expand_topic(message)
+                verified_claims = self._extract_verified(message)
+                hypotheticals   = self._extract_hypothetical(message)
+
+                # Register structured findings with the arbiter
+                for vc in verified_claims:
+                    self.arbiter.add_finding(
+                        claim=vc, status="confirmed",
+                        verified_by="dataset_chunk", agent=current_speaker.name,
+                    )
+                for hyp in hypotheticals:
+                    self.arbiter.add_finding(
+                        claim=hyp, status="uncertain",
+                        verified_by="none", agent=current_speaker.name,
+                    )
+                for false_txt in falsehoods:
+                    self.arbiter.add_finding(
+                        claim=false_txt, status="refuted",
+                        verified_by="debate", agent=current_speaker.name,
+                    )
 
                 # -- Update living topic --
                 for exp in expansions:
@@ -438,7 +479,13 @@ class DebateOrchestrator:
                     )
                     self._emit("branch", {"sub_topic": sub, "parent": topic, "turn": turn_index})
 
-                if new_subs or conclusions or contradictions or falsehoods:
+                # Add verified claims to graph as confirmed findings
+                for vc in verified_claims:
+                    self.graph.add_child(
+                        self._root_talking_point_id or "", "conclusion", f"✔ {vc[:120]}"
+                    )
+
+                if new_subs or conclusions or contradictions or falsehoods or verified_claims:
                     self._emit_graph()
 
                 # Rotate active talking point every few turns
@@ -510,12 +557,31 @@ class DebateOrchestrator:
                 self.telemetry.bump_turn()
 
                 # -- Arbiter --
+                # Pass agent name and the files that were in context this turn
+                # so the arbiter can track cited vs speculated modules.
+                chunks_used = []
+                if self._dataset_provider.loaded:
+                    seen = self._dataset_provider._seen_indices.get(current_speaker.name, set())
+                    facts = self._dataset_provider._facts
+                    chunks_used = [
+                        facts[i].get("source_path", facts[i].get("source_file", ""))
+                        for i in seen
+                    ]
                 decision = self.arbiter.evaluate(
-                    topic=topic, turn_index=turn_index, current_message=message
+                    topic=topic,
+                    turn_index=turn_index,
+                    current_message=message,
+                    agent_name=current_speaker.name,
+                    dataset_chunks_used=chunks_used,
                 )
                 if decision.intervention:
                     self.telemetry.bump_intervention()
-                    self._emit("arbiter", {"message": decision.message, "turn": turn_index})
+                    self._emit("arbiter", {
+                        "message": decision.message,
+                        "turn": turn_index,
+                        "fabrication_warning": decision.fabrication_warning,
+                        "exploration_directive": decision.exploration_directive,
+                    })
 
                 if decision.force_synthesis:
                     note = f"Synthesis checkpoint at turn {turn_index}: compare strongest claims and unresolved assumptions."
@@ -606,6 +672,9 @@ class DebateOrchestrator:
                 "living_topic": living_doc,
                 "agreements": "See CONCLUDE: items above for confirmed agreements.",
                 "next_steps": "Expand open contradictions; verify flagged claims.",
+                # Structured findings from the arbiter (replaces raw growing list)
+                "structured_findings": self.arbiter.synthesize_findings(),
+                "unread_modules": self.arbiter.get_unread_modules(),
             }
             self._emit("resolution", resolution)
 
@@ -646,7 +715,7 @@ class DebateOrchestrator:
         context: list[str] = []
         citations: list[dict] = []
         for snippet in snippets:
-            line = f"{snippet.title}: {snippet.snippet[:220].replace(chr(10), ' ')}"
+            line = f"[past-debate] {snippet.title}: {snippet.snippet[:220].replace(chr(10), ' ')}"
             context.append(line)
             self.evidence_store.add(claim=query[:180], support=line)
             citations.append(
@@ -655,6 +724,7 @@ class DebateOrchestrator:
                     "score": snippet.score,
                     "source": snippet.source_display,
                     "source_path": snippet.source,
+                    "corpus_tag": snippet.corpus_tag,
                     "excerpt": snippet.snippet[:180].replace("\n", " "),
                 }
             )

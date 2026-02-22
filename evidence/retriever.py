@@ -13,6 +13,9 @@ class EvidenceSnippet:
     source: str
     source_display: str
     score: float = 0.0
+    # Always "past-debate" for this retriever.  Agents must never treat these
+    # as authoritative about the *current* repo being analysed.
+    corpus_tag: str = "past-debate"
 
 
 class CorpusEvidenceRetriever:
@@ -88,6 +91,7 @@ class CorpusEvidenceRetriever:
                     source=item.source,
                     source_display=item.source_display,
                     score=round(score, 3),
+                    corpus_tag="past-debate",
                 )
             )
         return results

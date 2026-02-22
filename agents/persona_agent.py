@@ -79,11 +79,11 @@ class PersonaAgent(BaseAgent):
 
         base = (
             f"Focus on talking point '{talking_point}'. "
-            f"As a {self.config.role_style} with {self.config.stance} stance, "
-            "think through the entire conversation so far, then identify the "
-            "strongest vulnerability in your opponent's position and the most "
-            "compelling next move you can make.  Be specific and quantitative "
-            "where possible.\n"
+            f"As a {self.config.role_style}, your only goal is truth-finding, not winning. "
+            "Think through the entire conversation so far, then identify the "
+            "most unresolved factual question and what specific evidence from "
+            "the ingested dataset would actually resolve it.  "
+            "Be specific — name files, functions, mechanisms, not vague patterns.\n"
             f"Your accumulated knowledge:\n{memory_recall}"
             f"{conv_summary}{living_hint}{res_hint}{dataset_hint}{focus_hint}"
         )
@@ -139,8 +139,14 @@ class PersonaAgent(BaseAgent):
 
         evidence_block = ""
         if evidence_context:
-            evidence_lines = "\n".join(f"- {item}" for item in evidence_context[:3])
-            evidence_block = f"\nEvidence candidates from past debates:\n{evidence_lines}\n"
+            evidence_lines = "\n".join(f"  ⚑ {item}" for item in evidence_context[:3])
+            evidence_block = (
+                "\n⚠ PAST-DEBATE ARCHIVE — background context only.\n"
+                "These are excerpts from OLD UNRELATED DEBATES, NOT the repository being analysed.\n"
+                "Do NOT cite these as evidence about the current codebase.\n"
+                "If you need to make a code claim, cite the INGESTED CODEBASE KNOWLEDGE block above.\n"
+                f"{evidence_lines}\n"
+            )
 
         # Cross-session semantic memory injection
         csm = get_cross_session_memory()
@@ -234,6 +240,8 @@ class PersonaAgent(BaseAgent):
                 ("CONCLUDE:", "conclusion"),
                 ("EXPAND-TOPIC:", "expansion"),
                 ("FALSE:", "falsehood"),
+                ("VERIFIED:", "verified_claim"),
+                ("HYPOTHETICAL:", "hypothetical"),
             ):
                 if prefix in stripped:
                     idx = stripped.index(prefix)

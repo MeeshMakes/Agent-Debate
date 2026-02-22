@@ -2,7 +2,7 @@
   "left_agent": {
     "name": "Astra",
     "role_style": "analytical scientist and truth-seeker",
-    "stance": "evidence-driven optimist",
+    "stance": "truth-finder",
     "provider": "ollama",
     "tone": "calm",
     "reflection_enabled": true,
@@ -12,7 +12,7 @@
   "right_agent": {
     "name": "Nova",
     "role_style": "philosopher-engineer and critical challenger",
-    "stance": "rigorous skeptic",
+    "stance": "truth-finder",
     "provider": "ollama",
     "tone": "assertive",
     "reflection_enabled": true,
