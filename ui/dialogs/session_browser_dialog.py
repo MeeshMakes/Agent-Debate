@@ -39,8 +39,10 @@ class SessionBrowserDialog(QDialog):
     def __init__(self, session_manager: SessionManager, parent=None) -> None:
         super().__init__(parent)
         self._sm = session_manager
-        self.setWindowTitle("📚  Past Debate Sessions")
-        self.resize(1100, 680)
+        self.setWindowTitle("\u25B8 Past Debate Sessions")
+        self.resize(780, 600)
+        self.setMinimumSize(600, 400)
+        self.setMaximumWidth(900)
         self.setModal(False)
         self._apply_style()
         self._build_ui()
@@ -54,9 +56,15 @@ class SessionBrowserDialog(QDialog):
         main.setContentsMargins(12, 12, 12, 12)
         main.setSpacing(8)
 
-        header = QLabel("All Debate Sessions  —  click to preview · double-click to replay")
-        header.setStyleSheet("color: #90a4ae; font-size: 12px; padding-bottom: 4px;")
+        header = QLabel("\u25B8  Debate Sessions")
+        header.setStyleSheet(
+            "color: #c0e0ff; font-size: 13pt; font-weight: 900; "
+            "letter-spacing: 2px; padding: 4px 0 6px 0;"
+        )
+        sub = QLabel("click to preview  \u00b7  double-click to replay")
+        sub.setStyleSheet("color: #546e7a; font-size: 9pt; padding: 0 0 4px 0;")
         main.addWidget(header)
+        main.addWidget(sub)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main.addWidget(splitter, stretch=1)
@@ -69,12 +77,14 @@ class SessionBrowserDialog(QDialog):
 
         self._list = QListWidget()
         self._list.setObjectName("sessionList")
+        self._list.setMinimumWidth(240)
+        self._list.setMaximumWidth(320)
         self._list.setStyleSheet("""
-            QListWidget { background: #0d1520; border: 1px solid #1e2d42;
-                          border-radius: 6px; color: #cfd8dc; font-size: 13px; }
-            QListWidget::item { padding: 10px 12px; border-bottom: 1px solid #1a2840; }
-            QListWidget::item:selected { background: #1565c0; color: #fff; }
-            QListWidget::item:hover { background: #1a2840; }
+            QListWidget { background: #0b1420; border: 1px solid #1a2a44;
+                          border-radius: 8px; color: #cfd8dc; font-size: 10pt; }
+            QListWidget::item { padding: 8px 10px; border-bottom: 1px solid #162030; }
+            QListWidget::item:selected { background: #0e3a6e; color: #e0f0ff; }
+            QListWidget::item:hover { background: #12243a; }
         """)
         self._list.currentRowChanged.connect(self._on_row_changed)
         self._list.itemDoubleClicked.connect(self._on_double_click)
@@ -103,20 +113,25 @@ class SessionBrowserDialog(QDialog):
         rv.setContentsMargins(0, 0, 0, 0)
 
         self._detail_title = QLabel("Select a session to preview")
-        self._detail_title.setStyleSheet("color: #4dd0e1; font-size: 14px; font-weight: 700; padding: 4px 0;")
+        self._detail_title.setStyleSheet(
+            "color: #4dd0e1; font-size: 11pt; font-weight: 700; padding: 4px 0;"
+        )
+        self._detail_title.setWordWrap(True)
         rv.addWidget(self._detail_title)
 
         self._detail_browser = QTextBrowser()
         self._detail_browser.setStyleSheet(
-            "QTextBrowser { background: #0a1018; color: #b0bec5; border: 1px solid #1e2d42;"
-            " border-radius: 6px; font-size: 12px; padding: 8px; }"
+            "QTextBrowser { background: #080e18; color: #b0bec5; border: 1px solid #1a2a44;"
+            " border-radius: 8px; font-size: 10pt; padding: 10px; }"
         )
         self._detail_browser.setOpenExternalLinks(False)
         rv.addWidget(self._detail_browser)
 
         splitter.addWidget(left)
         splitter.addWidget(right)
-        splitter.setSizes([380, 700])
+        splitter.setSizes([280, 480])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
 
         # Bottom bar
         close_btn = QPushButton("Close")
@@ -154,20 +169,20 @@ class SessionBrowserDialog(QDialog):
             self._list.addItem(placeholder)
 
     def _format_list_item(self, meta: SessionMeta) -> str:
-        status_icon = {"complete": "✓", "stopped": "■", "running": "▶"}.get(meta.status, "·")
+        status_icon = {"complete": "\u2713", "stopped": "\u25A0", "running": "\u25B6"}.get(meta.status, "\u00b7")
         ts = datetime.fromtimestamp(meta.start_ts).strftime("%b %d  %H:%M")
         turns = f"{meta.turn_count}t"
         facts = meta.left_facts + meta.right_facts
         return (
-            f"  {status_icon}  {_short_topic(meta.topic)}\n"
-            f"      {ts}  ·  {turns}  ·  {facts} facts"
+            f"{status_icon}  {_short_topic(meta.topic, 38)}\n"
+            f"   {ts}  \u00b7  {turns}  \u00b7  {facts} facts"
         )
 
     def _on_row_changed(self, row: int) -> None:
         if row < 0 or row >= len(self._sessions):
             return
         meta = self._sessions[row]
-        self._detail_title.setText(f"📌  {meta.topic}")
+        self._detail_title.setText(f"\u25C6  {meta.topic}")
         self._detail_browser.setHtml(self._build_detail_html(meta))
 
     def _build_detail_html(self, meta: SessionMeta) -> str:
@@ -258,7 +273,8 @@ class SessionBrowserDialog(QDialog):
         self.setStyleSheet("""
             QDialog { background: #080d14; }
             QLabel  { color: #b0bec5; }
-            QSplitter::handle { background: #1e2d42; width: 2px; }
+            QSplitter::handle { background: #1a2a44; width: 2px; }
+            QPushButton { font-size: 9pt; }
         """)
 
 
