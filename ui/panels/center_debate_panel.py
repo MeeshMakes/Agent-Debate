@@ -587,16 +587,32 @@ class CenterDebatePanel(QWidget):
     # ── Public API ─────────────────────────────────────────────────────────
     def append_message(
         self,
-        text:          str,
-        agent_name:    str,
-        *,
+        *args,
         talking_point: str  = "",
         quality:       dict | None = None,
         citations:     list | None = None,
         model_name:    str  = "",
         turn_num:      int  = 0,
+        **_legacy_kwargs,
     ) -> int:
-        """Create a new turn page and return its msg_idx."""
+        """Create a new turn page and return its msg_idx.
+
+        Supports both call orders:
+            append_message(text, agent_name, ...)
+            append_message(agent_name, text, ...)
+
+        Extra legacy kwargs are accepted and ignored for compatibility.
+        """
+        if len(args) < 2:
+            raise TypeError("append_message requires two positional args")
+
+        first = str(args[0])
+        second = str(args[1])
+        if first.strip().lower() in {"astra", "nova"}:
+            agent_name, text = first, second
+        else:
+            text, agent_name = first, second
+
         msg_idx = len(self._pages)
         accent, bg = self._color_for_agent(agent_name)
         page = TurnPageWidget(
@@ -662,13 +678,31 @@ class CenterDebatePanel(QWidget):
         # Emit so any connected slots still receive the signal
         self.follow_mode_changed.emit(True)
 
-    def update_turn_indicator(self, current: int, total: int) -> None:
-        """Update the turn counter shown in the top bar."""
+    def update_turn_indicator(self, *args) -> None:
+        """Update top-bar turn counter.
+
+        Supports both legacy and current call patterns:
+            update_turn_indicator(current, total)
+            update_turn_indicator(agent_name, current, total)
+        """
+        current = 0
+        total = 0
+        if len(args) == 2:
+            current, total = args
+        elif len(args) == 3:
+            _agent_name, current, total = args
+        else:
+            return
+
+        try:
+            current = int(current)
+            total = int(total)
+        except Exception:
+            return
+
         self._total_turns = total
         if total > 0:
-            self._turn_lbl.setText(
-                f"TURN  {current} / {total}"
-            )
+            self._turn_lbl.setText(f"TURN  {current} / {total}")
         else:
             self._turn_lbl.setText("")
 
