@@ -36,3 +36,5 @@ desktop.ini
 # Misc
 *.bak
 *.tmp
+
+memory/adaptive_prompts.json
