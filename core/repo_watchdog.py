@@ -398,7 +398,40 @@ class RepoWatchdog:
         dir_lines = [f"  • {d}: {c} file(s)" for d, c in top_dirs[:10]]
 
         prioritized = self._prioritized_paths(snapshot.summaries)
-        focus_lines = [f"  • {p}" for p in prioritized[:10]]
+        focus_lines = [f"  • {p}" for p in prioritized[:20]]
+
+        # Build a lookup for fast excerpt access
+        excerpt_map = {s.relative_path: s.excerpt for s in snapshot.summaries}
+
+        # Include actual code excerpts from the top-priority files so the LLM
+        # can ground the brief in real method names, constants, and log signals
+        _MAX_EXCERPT_PER_FILE = 1_200   # chars per file in this brief
+        _MAX_EXCERPT_FILES    = 14      # how many files to include
+        _MAX_TOTAL_EXCERPT    = 18_000  # total excerpt budget
+
+        excerpt_sections: list[str] = []
+        total_excerpt_chars = 0
+        for rel in prioritized[:_MAX_EXCERPT_FILES]:
+            if total_excerpt_chars >= _MAX_TOTAL_EXCERPT:
+                break
+            raw = excerpt_map.get(rel, "").strip()
+            if not raw:
+                continue
+            # Skip low-signal files
+            if any(k in rel.lower() for k in (
+                "conversation", "transcript", "chatlog", "history", "export",
+                "workspace_conversations", "__pycache__",
+            )):
+                continue
+            snip = raw[:_MAX_EXCERPT_PER_FILE]
+            excerpt_sections.append(f"### {rel}\n```\n{snip}\n```")
+            total_excerpt_chars += len(snip)
+
+        excerpts_block = (
+            "\n\n".join(excerpt_sections)
+            if excerpt_sections
+            else "(no excerpts available)"
+        )
 
         return (
             "REPO WATCHDOG SNAPSHOT\n"
@@ -415,7 +448,14 @@ class RepoWatchdog:
             "Representative system files (code-first, low-noise):\n"
             + ("\n".join(focus_lines) if focus_lines else "  • (none)")
             + "\n\n"
-            "Use this snapshot as entry context. Prioritize executable scripts and their cross-file interactions first, then deep-dive into specific scripts and loops where failures or inconsistencies appear."
+            "--- KEY FILE EXCERPTS (actual source code) ---\n"
+            "Use these to extract real class names, method names, constants, log strings, "
+            "and failure paths for the debate brief.\n\n"
+            + excerpts_block
+            + "\n\n"
+            "Use this snapshot as entry context. Prioritize executable scripts and their "
+            "cross-file interactions first, then deep-dive into specific scripts and loops "
+            "where failures or inconsistencies appear."
         )
 
     def _profile_dir(self, repo: Path) -> Path:
