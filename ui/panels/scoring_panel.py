@@ -79,9 +79,20 @@ class ScoringPanel(QWidget):
             hdr_row.addWidget(l)
         root.addLayout(hdr_row)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # --- Live score feed ---
+        # --- Live score feed (left) ---
+        feed_container = QWidget()
+        feed_lay = QVBoxLayout(feed_container)
+        feed_lay.setContentsMargins(0, 0, 0, 0)
+        feed_lay.setSpacing(3)
+        feed_hdr = QLabel("\u25b8  SCORE LOG")
+        feed_hdr.setStyleSheet(
+            "font-size: 8.5pt; font-weight: 700; color: #546e7a;"
+            " letter-spacing: 1.5px; padding: 2px 0;"
+        )
+        feed_lay.addWidget(feed_hdr)
+
         self._feed = QTextBrowser()
         self._feed.setObjectName("scoreFeed")
         self._feed.setReadOnly(True)
@@ -90,10 +101,22 @@ class ScoringPanel(QWidget):
             "QTextBrowser { border: 1px solid #2a3a55; border-radius: 8px;"
             " background: #080d14; color: #cfd8dc; font-size: 9pt; }"
         )
-        self._feed.setPlaceholderText("Score log will appear here during the debate…")
-        splitter.addWidget(self._feed)
+        self._feed.setPlaceholderText("Score log will appear here during the debate\u2026")
+        feed_lay.addWidget(self._feed)
+        splitter.addWidget(feed_container)
 
-        # --- Verdict / Summary area ---
+        # --- Verdict / Summary area (right) ---
+        verdict_container = QWidget()
+        verdict_lay = QVBoxLayout(verdict_container)
+        verdict_lay.setContentsMargins(0, 0, 0, 0)
+        verdict_lay.setSpacing(3)
+        verdict_hdr = QLabel("\u25b8  VERDICT")
+        verdict_hdr.setStyleSheet(
+            "font-size: 8.5pt; font-weight: 700; color: #546e7a;"
+            " letter-spacing: 1.5px; padding: 2px 0;"
+        )
+        verdict_lay.addWidget(verdict_hdr)
+
         self._verdict = QTextBrowser()
         self._verdict.setObjectName("verdictArea")
         self._verdict.setReadOnly(True)
@@ -102,13 +125,13 @@ class ScoringPanel(QWidget):
             "QTextBrowser { border: 1px solid #37474f; border-radius: 8px;"
             " background: #0a0f1a; color: #e8eef9; font-size: 9.5pt; }"
         )
-        self._verdict.setPlaceholderText("Final verdict will appear here after the debate ends…")
-        self._verdict.setFixedHeight(180)
-        splitter.addWidget(self._verdict)
+        self._verdict.setPlaceholderText("Final verdict will appear here after the debate ends\u2026")
+        verdict_lay.addWidget(self._verdict)
+        splitter.addWidget(verdict_container)
 
         splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
-        splitter.setStyleSheet("QSplitter::handle { background: #1a3a55; height: 3px; }")
+        splitter.setStretchFactor(1, 2)
+        splitter.setStyleSheet("QSplitter::handle { background: #1a3a55; width: 3px; }")
         root.addWidget(splitter, stretch=1)
 
         # --- Buttons ---
