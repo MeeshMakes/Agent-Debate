@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -40,6 +42,7 @@ from config.model_prefs import (
 from agents.topic_refine_worker import TopicRefineWorker
 from config.starter_topics import STARTER_TOPICS
 from core.orchestrator import DebateEvent, DebateOrchestrator
+from core.repo_watchdog import RepoWatchdog
 from ingestion.ingestion_agent import IngestionWorker
 from memory.cross_session_memory import get_cross_session_memory
 from core.session_manager import get_session_manager
@@ -63,45 +66,36 @@ class _NoWheelComboBox(QComboBox):
 
 
 # ---------------------------------------------------------------------------
-# Ollama cloud model knowledge
+# Ollama cloud model detection
 # ---------------------------------------------------------------------------
-# Known models tagged "cloud" on ollama.com/search?c=cloud (Feb 2026).
-# These run on Ollama's datacenter servers, not local hardware.
-# Pricing is subscription-based: Free (limited), Pro $20/mo, Max $100/mo.
-# Source: https://ollama.com/pricing  https://ollama.com/search?c=cloud
-_KNOWN_CLOUD_MODELS: frozenset[str] = frozenset({
-    "qwen3.5",
-    "qwen3-coder-next",
-    "qwen3-next",
-    "qwen3-vl",          # large cloud variant (235b)
-    "glm-5",
-    "glm-4.7",
-    "glm-4.6",
-    "minimax-m2",
-    "minimax-m2.1",
-    "minimax-m2.5",
-    "kimi-k2.5",
-    "kimi-k2-thinking",
-    "ministral-3",
-    "rnj-1",
-    "nemotron-3-nano",
-    "devstral-small-2",
-    "devstral-2",
-    "gemini-3-flash-preview",
-    "cogito-2.1",
-    "deepseek-v3.2",
-})
+# Cloud models served by Ollama's datacenter appear with ":cloud" or
+# "-cloud" in their tag (e.g. "qwen3-coder:480b-cloud", "kimi-k2.5:cloud",
+# "deepseek-v3.1:671b-cloud").  All other models run locally.
 
 
 def _is_cloud_model(name: str) -> bool:
-    """Return True if the model name matches a known Ollama cloud model."""
-    base = name.split(":")[0].lower().strip()
-    return base in _KNOWN_CLOUD_MODELS
+    """Return True if the model name/tag indicates an Ollama cloud model.
+
+    Detection is based on the actual tag containing 'cloud' — the authoritative
+    indicator from Ollama's API.  This avoids false positives from local
+    variants of the same base model (e.g. qwen3-vl:8b is local, but
+    qwen3-vl:235b-cloud would be cloud).
+    """
+    lower = name.lower().strip()
+    # Tag-level: "model:480b-cloud", "model:cloud"
+    if ":" in lower:
+        tag = lower.split(":", 1)[1]
+        if "cloud" in tag:
+            return True
+    # Suffix-level fallback: "model-cloud"
+    if lower.endswith("-cloud"):
+        return True
+    return False
 
 
 def _clean_model_name(text: str) -> str:
-    """Strip the \u2601/ display prefixes from combo item text to get the raw model name."""
-    return text.replace("☁", "").replace("💻", "").strip()
+    """Strip the ☁/💻/◈ display prefixes from combo item text to get the raw model name."""
+    return text.replace("☁", "").replace("💻", "").replace("◈", "").strip()
 
 
 class _NoWheelSlider(QSlider):
@@ -434,6 +428,12 @@ class MainWindow(QMainWindow):
         # Latest resolution payload — used to feed TopicRefineWorker after debate ends
         self._last_resolution_payload: dict = {}
         self._refine_worker: TopicRefineWorker | None = None
+        self._repo_watchdog_meta: dict | None = None
+        self._repo_watchdog_last_sig: str = ""
+        self._repo_watchdog = RepoWatchdog(get_session_manager().root)
+        self._repo_watchdog_timer = QTimer(self)
+        self._repo_watchdog_timer.setInterval(12000)
+        self._repo_watchdog_timer.timeout.connect(self._poll_repo_watchdog)
 
         # -- panels --
         self.left_panel = LeftAgentPanel()
@@ -449,6 +449,7 @@ class MainWindow(QMainWindow):
         self._build_layout()
         self._build_toolbar()
         self._bind_events()
+        self._set_debate_transport_state("stopped")
         self.center_panel.set_source_click_handler(self.open_source_dialog)
 
         self._status_bar = QStatusBar()
@@ -693,6 +694,7 @@ class MainWindow(QMainWindow):
             "border-radius: 8px; padding: 7px 18px; border: 1px solid #26a69a; }"
             "QPushButton:hover { background: #00acc1; }"
             "QPushButton:pressed { background: #004d40; }"
+            "QPushButton:disabled { background: #102226; color: #4f6a6f; border: 1px solid #1d3a3f; }"
         )
 
         self.stop_button = QPushButton("■  Stop")
@@ -702,6 +704,7 @@ class MainWindow(QMainWindow):
             "stop:0 #c62828, stop:1 #8e0000); color: #fff; font-weight: 700; "
             "border-radius: 8px; padding: 7px 18px; border: 1px solid #e53935; }"
             "QPushButton:hover { background: #e53935; }"
+            "QPushButton:disabled { background: #2a1212; color: #7a5555; border: 1px solid #4a2020; }"
         )
 
         self._debate_pause_btn = QPushButton("⏸  Pause")
@@ -714,6 +717,7 @@ class MainWindow(QMainWindow):
             "QPushButton:checked { background: #e65100; color: #fff;"
             " border: 1px solid #ff8a65; }"
             "QPushButton:checked:hover { background: #f4511e; }"
+            "QPushButton:disabled { background: #1f2a30; color: #54656e; border: 1px solid #2f4049; }"
         )
         self._debate_pause_btn.setToolTip("Pair-aware pause: waits until both agents finish their current turns")
 
@@ -889,6 +893,41 @@ class MainWindow(QMainWindow):
         self._semantic_btn.toggled.connect(self._on_semantic_toggled)
         self._analytics_btn.clicked.connect(self._open_analytics_dialog)
 
+    def _set_debate_transport_state(self, state: str) -> None:
+        """Update Start/Stop/Pause button enabled + label state.
+
+        state: stopped | running | pausing | paused
+        """
+        if state == "stopped":
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self._debate_pause_btn.setEnabled(False)
+            self._debate_pause_btn.blockSignals(True)
+            self._debate_pause_btn.setChecked(False)
+            self._debate_pause_btn.blockSignals(False)
+            self._debate_pause_btn.setText("⏸  Pause")
+            return
+
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self._debate_pause_btn.setEnabled(True)
+
+        if state == "paused":
+            self._debate_pause_btn.blockSignals(True)
+            self._debate_pause_btn.setChecked(True)
+            self._debate_pause_btn.blockSignals(False)
+            self._debate_pause_btn.setText("▶  Resume")
+        elif state == "pausing":
+            self._debate_pause_btn.blockSignals(True)
+            self._debate_pause_btn.setChecked(True)
+            self._debate_pause_btn.blockSignals(False)
+            self._debate_pause_btn.setText("⏳  Pausing…")
+        else:
+            self._debate_pause_btn.blockSignals(True)
+            self._debate_pause_btn.setChecked(False)
+            self._debate_pause_btn.blockSignals(False)
+            self._debate_pause_btn.setText("⏸  Pause")
+
     def _refresh_topic_button(self) -> None:
         """Update the topic button label to show current selection."""
         label = self._current_topic_title
@@ -907,12 +946,57 @@ class MainWindow(QMainWindow):
             self._current_tp_key = dlg.tp_key
 
     def _on_topic_confirmed(self, title: str, full_context: str, files: list) -> None:
+        clean_context, repo_meta = self._extract_repo_watchdog_meta(full_context)
         self._current_topic_title = title
-        self._current_topic_context = full_context
+        self._current_topic_context = clean_context
+        self._repo_watchdog_meta = repo_meta
+        self._repo_watchdog_last_sig = ""
         self._pending_ingest_files = files
         self._refresh_topic_button()
         file_hint = f"  +  {len(files)} file(s) queued for ingestion" if files else ""
-        self._status_bar.showMessage(f"Topic set: {title[:80]}{file_hint}")
+        repo_hint = "  · repo watchdog linked" if repo_meta else ""
+        self._status_bar.showMessage(f"Topic set: {title[:80]}{file_hint}{repo_hint}")
+
+    def _load_repo_dataset_into_orchestrator(self) -> bool:
+        if self.orchestrator is None or not self._repo_watchdog_meta:
+            return False
+        repo_path = str(self._repo_watchdog_meta.get("repo_path", "") or "").strip()
+        if not repo_path:
+            return False
+
+        data = self._repo_watchdog.load_semantic_dataset(repo_path)
+        if not data:
+            try:
+                self._repo_watchdog.build_snapshot(repo_path)
+                data = self._repo_watchdog.load_semantic_dataset(repo_path)
+            except Exception:
+                data = None
+        if not data:
+            return False
+
+        facts = data.get("facts", []) if isinstance(data, dict) else []
+        meta = data.get("_meta", {}) if isinstance(data, dict) else {}
+        name = str(meta.get("name", "repo_watchdog_dataset"))
+        if not isinstance(facts, list) or not facts:
+            return False
+
+        self.orchestrator.load_dataset(facts, name=name)
+        return True
+
+    def _extract_repo_watchdog_meta(self, context: str) -> tuple[str, dict | None]:
+        match = re.search(r"\[REPO_WATCHDOG_META\](.*?)\[/REPO_WATCHDOG_META\]", context, re.DOTALL)
+        if not match:
+            return context, None
+
+        payload = match.group(1).strip()
+        meta = None
+        try:
+            meta = json.loads(payload)
+        except Exception:
+            meta = None
+
+        clean = (context[: match.start()] + context[match.end() :]).strip()
+        return clean, meta
 
     def _open_session_browser(self) -> None:
         if self._session_browser is None:
@@ -1104,54 +1188,63 @@ class MainWindow(QMainWindow):
             # Block signals while repopulating
             combo.blockSignals(True)
             combo.clear()
-            all_models = list(local_raw)
-            # Ensure preferred defaults and saved selections are present (local list)
-            for must_have in (saved, DEFAULT_LEFT_MODEL, DEFAULT_RIGHT_MODEL):
-                if must_have and must_have not in all_models and must_have not in self._vscode_model_ids:
-                    all_models.insert(0, must_have)
 
-            # Split into cloud vs local and sort each group alphabetically
-            cloud_models = sorted([m for m in all_models if _is_cloud_model(m)])
-            local_models = sorted([m for m in all_models if not _is_cloud_model(m)])
+            # Build the full model list from Ollama — these are REAL models
+            all_ollama = list(local_raw)
+
+            # Separate cloud-tagged models from true local models
+            # Cloud models have ":cloud" or "-cloud" in the Ollama tag
+            cloud_models = sorted([m for m in all_ollama if _is_cloud_model(m)])
+            local_models = sorted([m for m in all_ollama if not _is_cloud_model(m)])
+
+            # Ensure the saved selection and defaults are always selectable
+            # (even if Ollama didn't return them — e.g. model was pulled after last run)
+            for must_have in (saved, DEFAULT_LEFT_MODEL, DEFAULT_RIGHT_MODEL):
+                if must_have and must_have not in all_ollama and must_have not in self._vscode_model_ids:
+                    if _is_cloud_model(must_have):
+                        cloud_models.insert(0, must_have)
+                    else:
+                        local_models.insert(0, must_have)
+
+            from PyQt6.QtGui import QFont, QColor, QBrush
 
             def _add_header(combo: _NoWheelComboBox, text: str) -> None:
                 combo.addItem(text)
                 item = combo.model().item(combo.count() - 1)
                 item.setEnabled(False)
-                from PyQt6.QtGui import QFont, QColor, QBrush
                 f = QFont()
                 f.setBold(True)
                 f.setPointSize(8)
                 item.setFont(f)
                 item.setForeground(QBrush(QColor("#455a64")))
 
-            # ◈ VS Code models section (from bridge)
+            # ── Section 1: VS Code bridge models ─────────────────────────
             if self._vscode_model_ids:
-                _add_header(combo, "  ◈  VS Code Models")
+                _add_header(combo, "  ◈  VS Code Bridge")
                 for m in sorted(self._vscode_model_ids):
                     combo.addItem(f"  ◈ {m}")
                 combo.insertSeparator(combo.count())
 
+            # ── Section 2: Local Ollama models (always first / primary) ──
+            if local_models:
+                _add_header(combo, "  💻  Local Models")
+                for m in local_models:
+                    combo.addItem(f"  💻 {m}")
+
+            # ── Section 3: Cloud-tagged Ollama models ────────────────────
             if cloud_models:
+                if local_models:
+                    combo.insertSeparator(combo.count())
                 _add_header(combo, "  ☁  Cloud Models")
                 for m in cloud_models:
                     combo.addItem(f"  ☁ {m}")
-            if local_models:
-                if cloud_models:
-                    combo.insertSeparator(combo.count())
-                _add_header(combo, "  💻  Local Models")
-                for m in local_models:
-                    combo.addItem(f"  {m}")
 
-            # Restore saved selection — try exact match first, then with prefix
-            idx = combo.findText(saved)
-            if idx < 0:
-                # Try VS Code prefix
-                idx = combo.findText(f"  ◈ {saved}")
-            if idx < 0:
-                # Try cloud/local prefix
-                prefix = "  ☁ " if _is_cloud_model(saved) else "  "
+            # Restore saved selection — try with each prefix
+            idx = -1
+            for prefix in ("  💻 ", "  ☁ ", "  ◈ ", ""):
                 idx = combo.findText(f"{prefix}{saved}")
+                if idx >= 0:
+                    break
             if idx >= 0:
                 combo.setCurrentIndex(idx)
             combo.blockSignals(False)
@@ -1192,8 +1285,7 @@ class MainWindow(QMainWindow):
         self.center_panel.clear_messages()
         self.arbiter_panel.set_message("Arbiter watching...")
         self._continue_btn.setVisible(False)
-        self._debate_pause_btn.setChecked(False)
-        self._debate_pause_btn.setText("⏸  Pause")
+        self._set_debate_transport_state("running")
         self.arbiter_panel.set_paused_state(False)
         self.arbiter_panel.clear_staging()
         self.graph_panel.clear_rows()
@@ -1230,6 +1322,10 @@ class MainWindow(QMainWindow):
             session_manager=get_session_manager(),
             vscode_model_ids=self._vscode_model_ids,
         )
+        if self._repo_watchdog_meta:
+            loaded_repo_ds = self._load_repo_dataset_into_orchestrator()
+            if loaded_repo_ds:
+                self._status_bar.showMessage("Repo Watchdog semantic dataset loaded for debate context", 4500)
 
         # Refresh cross-session index before starting (skip running sessions automatically)
         csm = get_cross_session_memory()
@@ -1240,6 +1336,8 @@ class MainWindow(QMainWindow):
         self.worker.event_signal.connect(self.handle_event)
         self.worker.done_signal.connect(self._on_debate_done)
         self.worker.start()
+        self._set_debate_transport_state("running")
+        self._start_repo_watchdog()
 
         # Start ingestion if files were queued — wait 600 ms for session to be created
         if self._pending_ingest_files:
@@ -1249,21 +1347,109 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"Debate running [{mode_str}] — {topic[:60]}...")
 
     def stop_debate(self) -> None:
+        if self.worker is None or not self.worker.isRunning():
+            self._set_debate_transport_state("stopped")
+            return
         self.orchestrator.stop()
+        self._stop_repo_watchdog()
+        self._set_debate_transport_state("pausing")
         self._status_bar.showMessage("Stop requested — finishing current turn...")
+
+    def _start_repo_watchdog(self) -> None:
+        if not self._repo_watchdog_meta:
+            self._stop_repo_watchdog()
+            return
+        repo_path = self._repo_watchdog_meta.get("repo_path", "")
+        if repo_path:
+            try:
+                self._repo_watchdog.check_for_changes(repo_path)
+            except Exception:
+                pass
+        self._repo_watchdog_timer.start()
+
+    def _stop_repo_watchdog(self) -> None:
+        if self._repo_watchdog_timer.isActive():
+            self._repo_watchdog_timer.stop()
+
+    def _poll_repo_watchdog(self) -> None:
+        if not self._repo_watchdog_meta:
+            return
+        if self.worker is None or not self.worker.isRunning():
+            return
+
+        repo_path = self._repo_watchdog_meta.get("repo_path", "")
+        if not repo_path:
+            return
+
+        try:
+            changes = self._repo_watchdog.check_for_changes(repo_path)
+        except Exception:
+            return
+
+        if not changes.has_changes:
+            return
+
+        signature = json.dumps(
+            {"a": changes.added[:12], "m": changes.modified[:12], "d": changes.deleted[:12]},
+            sort_keys=True,
+        )
+        if signature == self._repo_watchdog_last_sig:
+            return
+        self._repo_watchdog_last_sig = signature
+
+        try:
+            report = self._repo_watchdog.update_docs_for_changes(repo_path, changes)
+            change_brief = self._repo_watchdog.build_change_brief(changes, report)
+        except Exception:
+            report = None
+            change_brief = "Repository changes detected, but incremental docs refresh failed."
+
+        if self.orchestrator is not None:
+            self._load_repo_dataset_into_orchestrator()
+
+        added = changes.added[:3]
+        modified = changes.modified[:3]
+        deleted = changes.deleted[:3]
+        lines: list[str] = []
+        if added:
+            lines.append("Added: " + ", ".join(added))
+        if modified:
+            lines.append("Modified: " + ", ".join(modified))
+        if deleted:
+            lines.append("Deleted: " + ", ".join(deleted))
+        short_msg = " | ".join(lines)
+
+        self.center_panel.append_message(
+            "Repo Watchdog",
+            f"Repository changes detected during debate. {short_msg}\n\n{change_brief}",
+        )
+        if self.orchestrator is not None:
+            self.orchestrator.inject_arbiter_message(
+                "[REPO WATCHDOG UPDATE]\n"
+                f"Detected repository changes: {short_msg}\n"
+                f"{change_brief}\n"
+                "Re-check any claims that depend on the changed files."
+            )
+        if report is not None:
+            self._status_bar.showMessage(
+                f"Repo Watchdog: {report.updated_files} docs refreshed, {report.deleted_files} removed",
+                5000,
+            )
+        else:
+            self._status_bar.showMessage("Repo Watchdog update injected into debate context", 5000)
 
     def _on_debate_pause_toggled(self, checked: bool) -> None:
         if not hasattr(self, 'orchestrator') or self.orchestrator is None:
             return
         if checked:
             self.orchestrator.pause()
-            self._debate_pause_btn.setText("⏳ Finishing…")
+            self._set_debate_transport_state("pausing")
             self._status_bar.showMessage("Pause requested — waiting for both agents to finish their turn…")
         else:
             # Manual uncheck (resume without injection)
             self.orchestrator.resume()
             self.arbiter_panel.set_paused_state(False)
-            self._debate_pause_btn.setText("⏸  Pause")
+            self._set_debate_transport_state("running")
             self._status_bar.showMessage("Debate resumed.")
 
     def _continue_debate(self) -> None:
@@ -1271,8 +1457,7 @@ class MainWindow(QMainWindow):
             return
         extra_turns = self._turns_slider.value()
         self._continue_btn.setVisible(False)
-        self._debate_pause_btn.setChecked(False)
-        self._debate_pause_btn.setText("⏸  Pause")
+        self._set_debate_transport_state("running")
 
         seed_topic = (
             self.orchestrator._living_topic.seed
@@ -1289,6 +1474,7 @@ class MainWindow(QMainWindow):
         self.worker.event_signal.connect(self.handle_event)
         self.worker.done_signal.connect(self._on_debate_done)
         self.worker.start()
+        self._start_repo_watchdog()
         self._status_bar.showMessage(f"Continuing debate for {extra_turns} more turns...")
 
     # ---------------------------------------------------------------- follow-text
@@ -1322,11 +1508,11 @@ class MainWindow(QMainWindow):
         self._cleanup_snippet_files(snippets)
         self.arbiter_panel.clear_staging()
         self.arbiter_panel.set_paused_state(False)
-        self._debate_pause_btn.setChecked(False)
-        self._debate_pause_btn.setText("⏸  Pause")
+        self._set_debate_transport_state("running")
         self._status_bar.showMessage(f"Injected: “{text[:60]}” — debate resumed.")
 
     def _on_debate_done(self) -> None:
+        self._stop_repo_watchdog()
         self._status_bar.showMessage("Debate complete — press Continue to add more turns")
         left_facts = len(self.orchestrator.left_agent.semantic_memory.facts)
         right_facts = len(self.orchestrator.right_agent.semantic_memory.facts)
@@ -1336,8 +1522,7 @@ class MainWindow(QMainWindow):
         if not self._endless_check.isChecked():
             self._continue_btn.setVisible(True)
         # Reset debate controls
-        self._debate_pause_btn.setChecked(False)
-        self._debate_pause_btn.setText("⏸  Pause")
+        self._set_debate_transport_state("stopped")
         self.arbiter_panel.set_paused_state(False)
 
         # Trigger debate summary + verdict worker
@@ -1450,11 +1635,9 @@ class MainWindow(QMainWindow):
         self._ingest_worker.progress.connect(
             lambda msg: self._status_bar.showMessage(f"[Ingestion] {msg}")
         )
-        self._ingest_worker.finished.connect(
-            lambda n: self._status_bar.showMessage(f"Ingestion complete — {n} facts indexed & semantically weighted")
-        )
+        self._ingest_worker.finished.connect(self._on_ingestion_done)
         self._ingest_worker.dataset_saved.connect(
-            lambda name: self._status_bar.showMessage(f"Dataset \"{name}\" saved to global store — rewrite tool can now use it", 6000)
+            lambda name: self._status_bar.showMessage(f"Dataset \"{name}\" saved to global store — agents now reading it like a LORA", 6000)
         )
         self._ingest_worker.failed.connect(
             lambda err: self._status_bar.showMessage(f"Ingestion failed: {err}")
@@ -1463,6 +1646,20 @@ class MainWindow(QMainWindow):
         # Clear the queue so rerunning the same debate doesn't re-ingest
         self._pending_ingest_files = []
         self._refresh_topic_button()
+
+    def _on_ingestion_done(self, num_facts: int) -> None:
+        """Called when background ingestion finishes — load dataset into orchestrator."""
+        self._status_bar.showMessage(
+            f"Ingestion complete — {num_facts} facts indexed & semantically weighted. Agents now dataset-aware."
+        )
+        # Load the ingested dataset into the orchestrator so agents can reference it
+        if hasattr(self, 'orchestrator') and self.orchestrator is not None:
+            loaded = self.orchestrator.load_dataset_from_session()
+            if loaded:
+                self._status_bar.showMessage(
+                    f"Ingestion complete — {num_facts} facts loaded as agent LORA context",
+                    6000,
+                )
 
     def _open_session_folder(self) -> None:
         """Open the current session directory in Windows Explorer."""
@@ -1830,7 +2027,7 @@ class MainWindow(QMainWindow):
         elif event.event_type == "paused":
             # Both agents finished — enable bottom composer
             pair = event.payload.get("pair", "")
-            self._debate_pause_btn.setText("⏸  Paused")
+            self._set_debate_transport_state("paused")
             self.arbiter_panel.set_paused_state(True)
             self.arbiter_panel.focus_input()
             self.arbiter_panel.set_message(

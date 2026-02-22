@@ -31,7 +31,6 @@ from PyQt6.QtWidgets import (
 )
 
 from analytics.analytics_store import AnalyticsRow, get_analytics_store
-from core.segue_buffer import get_segue_buffer, SegueEntry
 
 _ASTRA_COLOR = "#29b6f6"
 _NOVA_COLOR  = "#ff8a65"
@@ -203,51 +202,6 @@ class AnalyticsDialog(QDialog):
         st_lay.addWidget(splitter)
         self._tabs.addTab(sessions_tab, "📊 Sessions")
 
-        # ── Tab 2: Knowledge Gaps ──
-        gaps_tab = QWidget()
-        gt_lay = QVBoxLayout(gaps_tab)
-        gt_lay.setContentsMargins(12, 12, 12, 12)
-        gt_lay.setSpacing(10)
-
-        gaps_header = QLabel("Knowledge Gaps — Unresolved Segue Concepts")
-        gaps_header.setStyleSheet(
-            f"color: #ce93d8; font-size: 12pt; font-weight: 700;"
-        )
-        gt_lay.addWidget(gaps_header)
-
-        gaps_sub = QLabel(
-            "These concepts appeared repeatedly in debates but were never fully explored. "
-            "Promote them to create new talking points, or dismiss them."
-        )
-        gaps_sub.setWordWrap(True)
-        gaps_sub.setStyleSheet(f"color: {_TEXT_SUB}; font-size: 9pt;")
-        gt_lay.addWidget(gaps_sub)
-
-        gaps_scroll = QScrollArea()
-        gaps_scroll.setWidgetResizable(True)
-        gaps_scroll.setStyleSheet(
-            f"QScrollArea {{ background: transparent; border: none; }}"
-            f"QScrollBar:vertical {{ background: {_DIALOG_BG}; width: 6px; }}"
-            f"QScrollBar::handle:vertical {{ background: #2a3a55; border-radius: 3px; }}"
-        )
-        self._gaps_container = QWidget()
-        self._gaps_container.setStyleSheet("background: transparent;")
-        self._gaps_layout = QVBoxLayout(self._gaps_container)
-        self._gaps_layout.setContentsMargins(0, 0, 0, 0)
-        self._gaps_layout.setSpacing(8)
-        self._gaps_layout.addStretch()
-        gaps_scroll.setWidget(self._gaps_container)
-        gt_lay.addWidget(gaps_scroll, stretch=1)
-
-        # Refresh button
-        gaps_btn_row = QHBoxLayout()
-        gaps_refresh = QPushButton("🔄 Refresh Gaps")
-        gaps_refresh.clicked.connect(self._load_gaps)
-        gaps_btn_row.addStretch()
-        gaps_btn_row.addWidget(gaps_refresh)
-        gt_lay.addLayout(gaps_btn_row)
-
-        self._tabs.addTab(gaps_tab, "🔍 Knowledge Gaps")
         self._tabs.currentChanged.connect(self._on_tab_changed)
 
         root.addWidget(self._tabs)
@@ -444,140 +398,7 @@ class AnalyticsDialog(QDialog):
     # ─────────────────────────── actions ────────────────────────────────
 
     def _on_tab_changed(self, index: int) -> None:
-        if index == 1:  # Knowledge Gaps tab
-            self._load_gaps()
-
-    def _load_gaps(self) -> None:
-        """Populate the Knowledge Gaps tab with segue buffer entries."""
-        # Clear existing
-        while self._gaps_layout.count() > 1:  # keep the stretch
-            item = self._gaps_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
-        try:
-            buf = get_segue_buffer()
-            entries = buf.unresolved_entries()
-        except Exception:
-            entries = []
-
-        if not entries:
-            empty = QLabel("No unresolved knowledge gaps found.\n\n"
-                          "Run some debates first — the system will detect "
-                          "recurring lateral references automatically.")
-            empty.setWordWrap(True)
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setStyleSheet(f"color: {_TEXT_SUB}; font-size: 10pt; padding: 40px;")
-            self._gaps_layout.insertWidget(0, empty)
-            return
-
-        for entry in entries[:50]:
-            card = self._make_gap_card(entry)
-            self._gaps_layout.insertWidget(self._gaps_layout.count() - 1, card)
-
-    def _make_gap_card(self, entry: SegueEntry) -> QFrame:
-        """Create a card widget for a segue buffer entry."""
-        card = QFrame()
-        card.setStyleSheet(
-            f"QFrame {{ background: {_CARD_BG}; border: 1px solid {_BORDER_COLOR};"
-            f" border-radius: 8px; }}"
-        )
-        lay = QHBoxLayout(card)
-        lay.setContentsMargins(14, 10, 14, 10)
-        lay.setSpacing(12)
-
-        # Info column
-        info_col = QVBoxLayout()
-        info_col.setSpacing(2)
-
-        concept_lbl = QLabel(entry.concept)
-        concept_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        concept_lbl.setStyleSheet("color: #ce93d8; background: transparent;")
-        info_col.addWidget(concept_lbl)
-
-        meta_parts = [f"Mentioned {entry.mention_count}x"]
-        if entry.source_agents:
-            meta_parts.append(f"by {', '.join(list(entry.source_agents)[:3])}")
-        if entry.source_sessions:
-            meta_parts.append(f"in {len(entry.source_sessions)} session(s)")
-        meta_lbl = QLabel(" · ".join(meta_parts))
-        meta_lbl.setStyleSheet(f"color: {_TEXT_SUB}; font-size: 9pt; background: transparent;")
-        info_col.addWidget(meta_lbl)
-
-        if entry.surrounding_context:
-            ctx_lbl = QLabel(entry.surrounding_context[:120] + ("…" if len(entry.surrounding_context) > 120 else ""))
-            ctx_lbl.setWordWrap(True)
-            ctx_lbl.setStyleSheet(f"color: {_TEXT_SUB}; font-size: 8pt; font-style: italic; background: transparent;")
-            info_col.addWidget(ctx_lbl)
-
-        lay.addLayout(info_col, stretch=1)
-
-        # Action buttons
-        btn_col = QVBoxLayout()
-        btn_col.setSpacing(4)
-
-        promote_btn = QPushButton("⬆ Promote")
-        promote_btn.setStyleSheet(
-            "QPushButton { background: #1a0d2a; color: #ce93d8; border: 1px solid #7e57c2;"
-            " border-radius: 6px; padding: 4px 12px; font-size: 9pt; }"
-            "QPushButton:hover { background: #311b92; color: #fff; }"
-        )
-        _concept = entry.concept  # capture for closure
-        promote_btn.clicked.connect(lambda _, c=_concept: self._promote_gap(c))
-        btn_col.addWidget(promote_btn)
-
-        dismiss_btn = QPushButton("✕ Dismiss")
-        dismiss_btn.setStyleSheet(
-            "QPushButton { background: transparent; color: #546e7a; border: none;"
-            " padding: 4px 12px; font-size: 9pt; }"
-            "QPushButton:hover { color: #ef5350; }"
-        )
-        dismiss_btn.clicked.connect(lambda _, c=_concept: self._dismiss_gap(c))
-        btn_col.addWidget(dismiss_btn)
-
-        lay.addLayout(btn_col)
-        return card
-
-    def _promote_gap(self, concept: str) -> None:
-        """Promote a segue concept to an autonomous talking point."""
-        try:
-            buf = get_segue_buffer()
-            # Find the entry
-            for e in buf.all_entries():
-                if e.concept == concept:
-                    from config.autonomous_topics import get_autonomous_store
-                    store = get_autonomous_store()
-                    result = {
-                        "title": f"Exploring: {concept}",
-                        "description": (
-                            f"This concept appeared {e.mention_count} times across debates. "
-                            f"Context: {e.surrounding_context[:200]}"
-                        ),
-                        "talking_points": [
-                            f"What are the key implications of {concept}?",
-                            f"How does {concept} relate to our previous debates?",
-                            f"What evidence supports or challenges {concept}?",
-                        ],
-                        "segue_concept": concept,
-                        "segue_mentions": e.mention_count,
-                        "segue_sessions": list(e.source_sessions),
-                    }
-                    store.save(result)
-                    buf.mark_promoted(concept)
-                    break
-        except Exception:
-            pass
-        self._load_gaps()
-
-    def _dismiss_gap(self, concept: str) -> None:
-        """Dismiss a segue concept."""
-        try:
-            buf = get_segue_buffer()
-            buf.mark_dismissed(concept)
-        except Exception:
-            pass
-        self._load_gaps()
+        pass  # placeholder for future tabs
 
     def _open_session_folder(self) -> None:
         if self._selected_row and self._selected_row.session_path:

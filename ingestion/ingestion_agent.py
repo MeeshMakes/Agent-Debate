@@ -176,14 +176,20 @@ class IngestionWorker(QThread):
                     self.progress.emit(f"Copied: {src.name}")
                 elif src.is_dir():
                     for child in src.rglob("*"):
-                        if child.is_file() and child.suffix.lower() in _SUPPORTED:
-                            rel = child.relative_to(src.parent)
-                            dest = (
-                                uploads_dir
-                                / str(rel).replace("\\", "_").replace("/", "_")
-                            )
-                            shutil.copy2(child, dest)
-                            copied.append(dest)
+                        if not child.is_file():
+                            continue
+                        if child.suffix.lower() not in _SUPPORTED:
+                            continue
+                        # Skip excluded directories (.venv, __pycache__, .git, etc.)
+                        if any(part.lower() in _EXCLUDED_DIRS for part in child.relative_to(src).parts[:-1]):
+                            continue
+                        rel = child.relative_to(src.parent)
+                        dest = (
+                            uploads_dir
+                            / str(rel).replace("\\", "_").replace("/", "_")
+                        )
+                        shutil.copy2(child, dest)
+                        copied.append(dest)
                     self.progress.emit(f"Copied folder: {src.name}")
 
             if not copied:
@@ -250,4 +256,15 @@ _SUPPORTED = {
     ".txt", ".md", ".py", ".json", ".yaml", ".yml",
     ".csv", ".html", ".htm", ".rst", ".log", ".pdf",
     ".js", ".ts", ".toml", ".ini", ".cfg", ".xml",
+    ".bat", ".ps1", ".sh", ".jsx", ".tsx", ".css",
+    ".scss", ".less", ".sql", ".r", ".rb", ".go",
+    ".rs", ".java", ".kt", ".c", ".cpp", ".h", ".hpp",
 }
+
+# Directories to skip during recursive folder traversal
+_EXCLUDED_DIRS = frozenset({
+    "__pycache__", ".venv", "venv", ".git", "node_modules", ".pytest_cache",
+    ".mypy_cache", ".tox", ".eggs", "dist", "build", ".idea", ".vscode",
+    "env", ".env", ".story-reader", ".ai", ".morph", ".github",
+    ".ruff_cache", "__pypackages__", "site-packages", ".cargo",
+})

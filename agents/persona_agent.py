@@ -40,6 +40,8 @@ class PersonaAgent(BaseAgent):
         conversation_window: list[str] | None = None,
         living_topic_doc: str = "",
         resolution_context: str = "",
+        dataset_context: str = "",
+        focus_guidance: str = "",
     ) -> str:
         self._turn_counter += 1
 
@@ -66,6 +68,15 @@ class PersonaAgent(BaseAgent):
         if resolution_context:
             res_hint = f"\n{resolution_context[:400]}"
 
+        # Dataset knowledge (ingested codebase / uploaded files)
+        dataset_hint = ""
+        if dataset_context:
+            dataset_hint = f"\n{dataset_context}"
+
+        focus_hint = ""
+        if focus_guidance:
+            focus_hint = f"\nFocus analytics guidance:\n{focus_guidance}"
+
         base = (
             f"Focus on talking point '{talking_point}'. "
             f"As a {self.config.role_style} with {self.config.stance} stance, "
@@ -74,7 +85,7 @@ class PersonaAgent(BaseAgent):
             "compelling next move you can make.  Be specific and quantitative "
             "where possible.\n"
             f"Your accumulated knowledge:\n{memory_recall}"
-            f"{conv_summary}{living_hint}{res_hint}"
+            f"{conv_summary}{living_hint}{res_hint}{dataset_hint}{focus_hint}"
         )
 
         if self.config.reflection_enabled:
@@ -103,6 +114,8 @@ class PersonaAgent(BaseAgent):
         conversation_window: list[str] | None = None,
         living_topic_doc: str = "",
         resolution_context: str = "",
+        dataset_context: str = "",
+        focus_guidance: str = "",
     ) -> str:
         # Build memory context for prompt
         recall_query = f"{topic} {talking_point} {opponent_last_message[:200]}"
@@ -120,6 +133,8 @@ class PersonaAgent(BaseAgent):
             conversation_history=conversation_window,
             living_topic_doc=living_topic_doc,
             resolution_context=resolution_context,
+            dataset_context=dataset_context,
+            focus_guidance=focus_guidance,
         )
 
         evidence_block = ""

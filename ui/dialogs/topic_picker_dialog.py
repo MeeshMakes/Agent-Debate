@@ -3,7 +3,7 @@
 Replaces the dropdown. Opens as a large pop-out:
   Left column  — clickable topic cards (title + 2-line teaser)
   Right panel  — full description + talking points for selected topic
-                 Editable when "Custom Topic" is selected; read-only for presets
+                 Editable when "Custom Debate" is selected; read-only for presets
   Bottom row   — file ingestion toggle + "Start this topic" confirm
 
 Emits: topic_confirmed(title: str, full_context: str, file_paths: list[str])
@@ -11,6 +11,7 @@ Emits: topic_confirmed(title: str, full_context: str, file_paths: list[str])
 """
 from __future__ import annotations
 
+import json
 import hashlib
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +20,7 @@ from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -31,6 +33,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSlider,
@@ -43,11 +46,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QDesktopServices
 
 from config.starter_topics import STARTER_TOPICS, StarterTopic
-from config.autonomous_topics import (
-    AutonomousTopic, get_autonomous_store,
-)
+from core.custom_debates import CustomDebate, get_custom_debate_store
+from core.repo_watchdog import RepoWatchdog
 from core.session_manager import get_session_manager, SessionMeta
-from core.segue_buffer import get_segue_buffer, SegueEntry
 from ingestion.ingestion_agent import get_datasets_dir, list_global_datasets
 
 
@@ -138,6 +139,105 @@ class _RewriteWorker(QThread):
             self.failed.emit(f"Rewrite failed: {exc}")
 
 
+class _RepoSchemaWorker(QThread):
+    """Background worker that prepares a repo-specific debate schema."""
+
+    finished = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        *,
+        repo_path: str,
+        repo_brief: str,
+        model: str = "qwen3:30b",
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._repo_path = repo_path
+        self._repo_brief = repo_brief
+        self._model = model
+
+    def run(self) -> None:
+        try:
+            import httpx
+            import re
+
+            prompt = (
+                "You are a Repository Debate Prep Agent. Build a repo-specific debate setup.\n\n"
+                "Return JSON only, wrapped in ```json ... ``` with this exact shape:\n"
+                "{\n"
+                '  "title": "...",\n'
+                '  "description": "...",\n'
+                '  "talking_points": ["..."],\n'
+                '  "prep_schema": {\n'
+                '    "modules_to_probe": ["..."],\n'
+                '    "risky_areas": ["..."],\n'
+                '    "evidence_checklist": ["..."],\n'
+                '    "watch_signals": ["..."]\n'
+                "  }\n"
+                "}\n\n"
+                "Rules:\n"
+                "- title: concise, repo-specific\n"
+                "- description: 2-4 paragraphs, debate-ready\n"
+                "- talking_points: 6-10 sharp contestable claims (not questions)\n"
+                "- prep_schema lists must be practical and concrete\n"
+                "- IMPORTANT PRIORITY ORDER for program understanding:\n"
+                "  1) identify and explain the core executable scripts/modules first\n"
+                "  2) map how scripts call/interact with each other across the system\n"
+                "  3) form a system-level understanding before making strong conclusions\n"
+                "  4) then hyper-focus on specific problematic scripts, loops, or failure paths\n"
+                "  5) include at least one talking point on what currently works well and how to improve it\n"
+                "- no markdown outside JSON\n\n"
+                f"Repository Path:\n{self._repo_path}\n\n"
+                f"Repository Snapshot Brief:\n{self._repo_brief[:9000]}"
+            )
+
+            payload = {
+                "model": self._model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+            }
+            response = httpx.post(
+                "http://localhost:11434/api/chat",
+                json=payload,
+                timeout=240.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            text = (
+                data.get("message", {}).get("content", "")
+                or data.get("response", "")
+            ).strip()
+            if not text:
+                self.failed.emit("Repo prep agent returned empty output.")
+                return
+
+            match = re.search(r"```json\s*\n?(.*?)\n?```", text, re.DOTALL)
+            raw = match.group(1).strip() if match else text
+            result = json.loads(raw)
+
+            title = str(result.get("title", "")).strip()
+            description = str(result.get("description", "")).strip()
+            talking_points = result.get("talking_points", [])
+            prep_schema = result.get("prep_schema", {})
+
+            if not title or not description or not isinstance(talking_points, list) or not talking_points:
+                self.failed.emit("Repo prep agent returned incomplete schema data.")
+                return
+
+            self.finished.emit(
+                {
+                    "title": title,
+                    "description": description,
+                    "talking_points": [str(tp).strip() for tp in talking_points if str(tp).strip()],
+                    "prep_schema": prep_schema if isinstance(prep_schema, dict) else {},
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(f"Repo prep failed: {exc}")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -166,11 +266,26 @@ _CARD_W = 290
 
 class _TopicCard(QFrame):
     clicked = pyqtSignal(int)   # emits index
+    delete_requested = pyqtSignal(str)
 
-    def __init__(self, index: int, topic: StarterTopic, parent=None) -> None:
+    def __init__(
+        self,
+        index: int,
+        *,
+        title: str,
+        description: str,
+        talking_points_count: int = 0,
+        repo_mode: bool = False,
+        deletable: bool = False,
+        debate_id: str = "",
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self._index = index
         self._selected = False
+        self._repo_mode = repo_mode
+        self._deletable = deletable
+        self._debate_id = debate_id
         self.setFixedWidth(_CARD_W)
         self.setObjectName("topicCard")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -180,38 +295,45 @@ class _TopicCard(QFrame):
         lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(4)
 
-        title_lbl = QLabel(topic.title)
+        title_lbl = QLabel(title)
         title_lbl.setWordWrap(True)
         title_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        title_lbl.setStyleSheet(f"color: {_PALETTE['accent']}; background: transparent;")
+        title_color = "#ce93d8" if repo_mode else _PALETTE["accent"]
+        title_lbl.setStyleSheet(f"color: {title_color}; background: transparent;")
         lay.addWidget(title_lbl)
 
         # Two-line teaser from description
-        teaser = (topic.description[:160] + "…") if len(topic.description) > 160 else topic.description
+        teaser = (description[:160] + "…") if len(description) > 160 else description
         teaser_lbl = QLabel(teaser)
         teaser_lbl.setWordWrap(True)
         teaser_lbl.setFont(QFont("Segoe UI", 9))
         teaser_lbl.setStyleSheet(f"color: {_PALETTE['dim']}; background: transparent;")
         lay.addWidget(teaser_lbl)
 
-        if topic.talking_points:
-            tp_count = QLabel(f"  {len(topic.talking_points)} talking points")
+        if talking_points_count:
+            suffix = "  ·  repo" if repo_mode else ""
+            tp_count = QLabel(f"  {talking_points_count} talking points{suffix}")
             tp_count.setFont(QFont("Segoe UI", 8))
-            tp_count.setStyleSheet(f"color: #2a7a8a; background: transparent;")
+            tp_count_color = "#7e57c2" if repo_mode else "#2a7a8a"
+            tp_count.setStyleSheet(f"color: {tp_count_color}; background: transparent;")
             lay.addWidget(tp_count)
 
         self._refresh_style()
 
     def _refresh_style(self) -> None:
+        border_sel = "#9c27b0" if self._repo_mode else _PALETTE["border_sel"]
+        border = "#2a1a3e" if self._repo_mode else _PALETTE["border"]
+        card_bg = "#120d1e" if self._repo_mode else _PALETTE["card"]
+        card_sel = "#1a0d2a" if self._repo_mode else _PALETTE["card_sel"]
         if self._selected:
             self.setStyleSheet(
-                f"QFrame#topicCard {{ background: {_PALETTE['card_sel']};"
-                f" border: 2px solid {_PALETTE['border_sel']}; border-radius: 10px; }}"
+                f"QFrame#topicCard {{ background: {card_sel};"
+                f" border: 2px solid {border_sel}; border-radius: 10px; }}"
             )
         else:
             self.setStyleSheet(
-                f"QFrame#topicCard {{ background: {_PALETTE['card']};"
-                f" border: 1px solid {_PALETTE['border']}; border-radius: 10px; }}"
+                f"QFrame#topicCard {{ background: {card_bg};"
+                f" border: 1px solid {border}; border-radius: 10px; }}"
             )
 
     def set_selected(self, sel: bool) -> None:
@@ -221,6 +343,21 @@ class _TopicCard(QFrame):
     def mousePressEvent(self, event) -> None:
         self.clicked.emit(self._index)
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        if not self._deletable or not self._debate_id:
+            return super().contextMenuEvent(event)
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: #0d1520; color: {_PALETTE['text']};"
+            f" border: 1px solid {_PALETTE['border']}; font-size: 11px; }}"
+            "QMenu::item:selected { background: #0d2030; }"
+        )
+        del_action = menu.addAction("🗑  Delete Debate Widget")
+        chosen = menu.exec(event.globalPos())
+        if chosen == del_action:
+            self.delete_requested.emit(self._debate_id)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -856,101 +993,11 @@ class _TranscriptViewerPanel(QWidget):
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Autonomous topic card (purple)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class _AutonomousTopicCard(QFrame):
-    """Clickable card for an autonomous talking point — purple accent."""
-    clicked = pyqtSignal(str)   # emits filename
-    delete_requested = pyqtSignal(str)   # emits filename
-
-    def __init__(self, at: AutonomousTopic, parent=None) -> None:
-        super().__init__(parent)
-        self._filename = at.filename
-        self._selected = False
-        self.setFixedWidth(_CARD_W)
-        self.setObjectName("autoTopicCard")
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(4)
-
-        title_lbl = QLabel(at.title if len(at.title) <= 48 else at.title[:48] + "…")
-        title_lbl.setWordWrap(True)
-        title_lbl.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        title_lbl.setStyleSheet("color: #ce93d8; background: transparent;")
-        title_lbl.setToolTip(at.title)
-        lay.addWidget(title_lbl)
-
-        teaser = (at.description[:140] + "…") if len(at.description) > 140 else at.description
-        teaser_lbl = QLabel(teaser)
-        teaser_lbl.setWordWrap(True)
-        teaser_lbl.setFont(QFont("Segoe UI", 9))
-        teaser_lbl.setStyleSheet(f"color: {_PALETTE['dim']}; background: transparent;")
-        lay.addWidget(teaser_lbl)
-
-        meta_row = QHBoxLayout()
-        tp_count = QLabel(f"  {len(at.talking_points)} talking points")
-        tp_count.setFont(QFont("Segoe UI", 8))
-        tp_count.setStyleSheet("color: #7e57c2; background: transparent;")
-        meta_row.addWidget(tp_count)
-
-        if at.segue_concept:
-            origin_lbl = QLabel(f"  segue: {at.segue_concept[:30]}")
-            origin_lbl.setFont(QFont("Segoe UI", 7))
-            origin_lbl.setStyleSheet("color: #546e7a; background: transparent;")
-            meta_row.addWidget(origin_lbl)
-
-        meta_row.addStretch()
-        lay.addLayout(meta_row)
-
-        self._refresh_style()
-
-    def _refresh_style(self) -> None:
-        if self._selected:
-            self.setStyleSheet(
-                "QFrame#autoTopicCard { background: #1a0d2a;"
-                " border: 2px solid #9c27b0; border-radius: 10px; }"
-            )
-        else:
-            self.setStyleSheet(
-                f"QFrame#autoTopicCard {{ background: #120d1e;"
-                f" border: 1px solid #2a1a3e; border-radius: 10px; }}"
-            )
-
-    def set_selected(self, sel: bool) -> None:
-        self._selected = sel
-        self._refresh_style()
-
-    def mousePressEvent(self, event) -> None:
-        self.clicked.emit(self._filename)
-        super().mousePressEvent(event)
-
-    def contextMenuEvent(self, event) -> None:
-        menu = QMenu(self)
-        menu.setStyleSheet(
-            f"QMenu {{ background: #0d1520; color: {_PALETTE['text']};"
-            f" border: 1px solid {_PALETTE['border']}; font-size: 11px; }}"
-            "QMenu::item:selected { background: #0d2030; }"
-        )
-        del_action = menu.addAction("🗑  Delete this talking point")
-        promote_action = menu.addAction("⬆  Promote to Custom")
-        chosen = menu.exec(event.globalPos())
-        if chosen == del_action:
-            self.delete_requested.emit(self._filename)
-        elif chosen == promote_action:
-            store = get_autonomous_store()
-            store.promote_to_custom(self._filename)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Topic Assistant — chatbot panel
+#  Debate Assistant — chatbot panel
 # ──────────────────────────────────────────────────────────────────────────────
 
 class _AssistantChatPanel(QWidget):
-    """Lightweight agent chatbot for creating talking points conversationally."""
+    """Lightweight agent chatbot for helping create / edit debates."""
 
     topic_created = pyqtSignal(dict)   # emitted when assistant generates a TP
 
@@ -965,12 +1012,12 @@ class _AssistantChatPanel(QWidget):
         lay.setContentsMargins(12, 8, 12, 8)
         lay.setSpacing(6)
 
-        header = QLabel("Topic Assistant")
+        header = QLabel("Debate Assistant")
         header.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         header.setStyleSheet(f"color: {_PALETTE['accent']}; background: transparent;")
         lay.addWidget(header)
 
-        sub = QLabel("Chat with the assistant to create new talking points")
+        sub = QLabel("Chat with the assistant to create or refine debates")
         sub.setFont(QFont("Segoe UI", 9))
         sub.setStyleSheet(f"color: {_PALETTE['dim']}; background: transparent;")
         lay.addWidget(sub)
@@ -990,7 +1037,7 @@ class _AssistantChatPanel(QWidget):
         input_row.setSpacing(6)
         self._input = QLineEdit()
         self._input.setPlaceholderText(
-            "e.g. Make a talking point about submarine pressure physics..."
+            "e.g. Create a debate about submarine pressure physics..."
         )
         self._input.setStyleSheet(
             f"QLineEdit {{ background: {_PALETTE['bg']}; color: {_PALETTE['text']};"
@@ -1012,31 +1059,21 @@ class _AssistantChatPanel(QWidget):
         input_row.addWidget(self._send_btn)
         lay.addLayout(input_row)
 
-        # Button row
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(6)
-        new_tp_btn = QPushButton("📁 New Talking Point")
-        new_tp_btn.setStyleSheet(
-            f"QPushButton {{ background: #1a2840; color: #90a4ae; border-radius: 6px;"
-            f" padding: 5px 14px; font-size: 10px; border: 1px solid {_PALETTE['border']}; }}"
-            "QPushButton:hover { background: #1e3a5f; color: #fff; }"
-        )
-        new_tp_btn.clicked.connect(self._on_new_tp)
-        btn_row.addWidget(new_tp_btn)
-        btn_row.addStretch()
-
+        # Status row
+        status_row = QHBoxLayout()
+        status_row.addStretch()
         self._status = QLabel("")
         self._status.setStyleSheet(
             f"color: {_PALETTE['dim']}; font-size: 9px; background: transparent;"
         )
-        btn_row.addWidget(self._status)
-        lay.addLayout(btn_row)
+        status_row.addWidget(self._status)
+        lay.addLayout(status_row)
 
         # Initial welcome message
         self._append_system(
-            "Welcome to the Topic Assistant! I can help you create new debate "
-            "talking points. Just describe what you want to explore and I'll "
-            "generate a full talking point with title, description, and focal anchors."
+            "Welcome to the Debate Assistant! I can help you create new debate "
+            "topics or refine existing ones. Describe what you want to explore "
+            "and I'll generate a full debate with title, description, and talking points."
         )
 
     def _append_user(self, text: str) -> None:
@@ -1051,14 +1088,6 @@ class _AssistantChatPanel(QWidget):
             f'<div style="color:{_PALETTE["text"]};margin-bottom:6px;">{text}</div>'
         )
 
-    def _on_new_tp(self) -> None:
-        self._append_system(
-            "What would you like to explore? Describe the topic you want to create "
-            "a talking point for — I'll generate the title, description, and focal "
-            "anchors automatically."
-        )
-        self._input.setFocus()
-
     def _on_send(self) -> None:
         text = self._input.text().strip()
         if not text:
@@ -1072,11 +1101,10 @@ class _AssistantChatPanel(QWidget):
         self._status.setText("Generating...")
 
         # Gather context
-        from config.autonomous_topics import get_autonomous_store
         from config.starter_topics import get_topic_titles
         from analytics.analytics_store import get_analytics_store
 
-        existing = get_topic_titles() + get_autonomous_store().titles()
+        existing = get_topic_titles()
 
         # Analytics summary
         try:
@@ -1089,20 +1117,6 @@ class _AssistantChatPanel(QWidget):
             )
         except Exception:
             analytics_text = ""
-
-        # Segue buffer summary
-        try:
-            buf = get_segue_buffer()
-            unresolved = buf.unresolved_entries()
-            if unresolved:
-                segue_text = "Unresolved segue concepts:\n" + "\n".join(
-                    f"  - {e.concept} (mentioned {e.mention_count}x)"
-                    for e in unresolved[:10]
-                )
-            else:
-                segue_text = ""
-        except Exception:
-            segue_text = ""
 
         # Model
         try:
@@ -1117,7 +1131,7 @@ class _AssistantChatPanel(QWidget):
             model=model,
             existing_titles=existing,
             analytics_summary=analytics_text,
-            segue_context=segue_text,
+            segue_context="",
             origin="user",
             parent=self,
         )
@@ -1131,11 +1145,11 @@ class _AssistantChatPanel(QWidget):
 
     def _on_worker_done(self, result: dict) -> None:
         self._send_btn.setEnabled(True)
-        title = result.get("title", "New Topic")
+        title = result.get("title", "New Debate")
         tp_count = len(result.get("talking_points", []))
         self._status.setText(f"✓ Created: {title}")
         self._append_system(
-            f"✅ Created talking point: <b>{title}</b> with {tp_count} focal anchors. "
+            f"✅ Created debate: <b>{title}</b> with {tp_count} talking points. "
             "It's been added to your list."
         )
         self.topic_created.emit(result)
@@ -1154,16 +1168,22 @@ class TopicPickerDialog(QDialog):
 
     def __init__(self, current_title: str = "", parent=None) -> None:
         super().__init__(parent)
+        session_root = get_session_manager().root
+        self._custom_debate_store = get_custom_debate_store(session_root)
+        self._custom_debates: list[CustomDebate] = []
+        self._card_entries: list[dict] = []
+        self._active_custom_id: str | None = None
         self.setWindowTitle("Debate Studio")
         self.resize(1620, 860)
         self.setModal(True)
         self._queued_files: list[Path] = []
         self._selected_index: int = 0
         self._cards: list[_TopicCard] = []
-        self._auto_cards: list[_AutonomousTopicCard] = []
-        self._selected_auto_filename: str = ""
+        self._card_col: QVBoxLayout | None = None
         self._rewrite_worker: _RewriteWorker | None = None
-        self._promotion_worker = None
+        self._repo_schema_worker: _RepoSchemaWorker | None = None
+        self._repo_schema_generated_once: bool = False
+        self._repo_all_models: list[str] = []
         # Per-talking-point key for session history
         self._current_tp_key: str = ""
         # References to new panels (set in _build_ui)
@@ -1172,7 +1192,8 @@ class TopicPickerDialog(QDialog):
         self._dataset_library: _DatasetLibraryPanel | None = None
         self._assistant_panel: _AssistantChatPanel | None = None
         self._main_splitter: QSplitter | None = None
-        self._autonomous_learning_enabled: bool = False
+        self._repo_watchdog = RepoWatchdog(session_root)
+        self._load_persisted_custom_debates()
         self._apply_style()
         self._build_ui(current_title)
 
@@ -1204,7 +1225,7 @@ class TopicPickerDialog(QDialog):
         h_title = QLabel("Debate Studio")
         h_title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
         h_title.setStyleSheet(f"color: {_PALETTE['accent']}; background: transparent;")
-        h_sub = QLabel("Select a curated brief, create new talking points with the assistant, or let autonomous learning generate them")
+        h_sub = QLabel("Select a curated brief, create/edit debates with the assistant, or link a repository with Repo Watchdog")
         h_sub.setFont(QFont("Segoe UI", 9))
         h_sub.setStyleSheet(f"color: {_PALETTE['dim']}; background: transparent;")
         hl.addWidget(h_title)
@@ -1238,30 +1259,8 @@ class TopicPickerDialog(QDialog):
         card_col = QVBoxLayout(card_widget)
         card_col.setContentsMargins(0, 0, 0, 0)
         card_col.setSpacing(8)
-
-        for i, topic in enumerate(STARTER_TOPICS):
-            card = _TopicCard(i, topic)
-            card.clicked.connect(self._select_topic)
-            self._cards.append(card)
-            card_col.addWidget(card)
-
-        # ── Autonomous topics divider + cards ────────────────────────────────
-        self._auto_divider = QLabel("── AUTONOMOUS ──")
-        self._auto_divider.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        self._auto_divider.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._auto_divider.setStyleSheet(
-            "color: #7e57c2; background: transparent; margin-top: 12px;"
-        )
-        card_col.addWidget(self._auto_divider)
-
-        self._auto_card_container = QVBoxLayout()
-        self._auto_card_container.setSpacing(8)
-        card_col.addLayout(self._auto_card_container)
-
-        # Load existing autonomous topics
-        self._refresh_auto_cards()
-
-        card_col.addStretch()
+        self._card_col = card_col
+        self._rebuild_left_cards()
         scroll.setWidget(card_widget)
         left_lay.addWidget(scroll)
         splitter.addWidget(left_container)
@@ -1293,6 +1292,113 @@ class TopicPickerDialog(QDialog):
         title_row.addWidget(self._preset_title_lbl, stretch=1)
         title_row.addWidget(self._custom_title_edit, stretch=1)
         right_lay.addLayout(title_row)
+
+        # Custom Debate mode selector
+        mode_grp = QGroupBox("Custom Debate Mode")
+        mode_grp.setObjectName("detailGroup")
+        mode_lay = QVBoxLayout(mode_grp)
+        mode_lay.setSpacing(6)
+        self._custom_mode_group = mode_grp
+
+        self._mode_static_rb = QRadioButton("Static Ingestion (manual brief)")
+        self._mode_repo_rb = QRadioButton("Repo Watchdog (link to repository)")
+        self._mode_static_rb.setChecked(True)
+        self._mode_static_rb.setStyleSheet(
+            "QRadioButton { background: #111a29; color: #9fc1d5; border: 1px solid #2a3a55;"
+            " border-radius: 8px; padding: 6px 10px; font-size: 11px; font-weight: 600; }"
+            "QRadioButton:checked { background: #2e1a47; color: #f3e5f5; border: 1px solid #7e57c2; }"
+            "QRadioButton:hover { border: 1px solid #4b6483; }"
+            "QRadioButton::indicator { width: 0px; height: 0px; }"
+        )
+        self._mode_repo_rb.setStyleSheet(
+            "QRadioButton { background: #111a29; color: #9fc1d5; border: 1px solid #2a3a55;"
+            " border-radius: 8px; padding: 6px 10px; font-size: 11px; font-weight: 600; }"
+            "QRadioButton:checked { background: #2e1a47; color: #f3e5f5; border: 1px solid #7e57c2; }"
+            "QRadioButton:hover { border: 1px solid #4b6483; }"
+            "QRadioButton::indicator { width: 0px; height: 0px; }"
+        )
+
+        self._mode_static_rb.toggled.connect(self._on_custom_mode_changed)
+        self._mode_repo_rb.toggled.connect(self._on_custom_mode_changed)
+
+        mode_lay.addWidget(self._mode_static_rb)
+        mode_lay.addWidget(self._mode_repo_rb)
+
+        repo_row = QHBoxLayout()
+        self._repo_path_edit = QLineEdit()
+        self._repo_path_edit.setPlaceholderText("Select a repository folder to link to this debate…")
+        self._repo_path_edit.setStyleSheet(
+            f"QLineEdit {{ background: {_PALETTE['bg']}; color: #e8eaf6; border: 1px solid {_PALETTE['border']};"
+            " border-radius: 6px; padding: 6px 10px; font-size: 11px; }}"
+            f"QLineEdit:focus {{ border-color: {_PALETTE['accent']}; }}"
+        )
+        self._repo_path_edit.setVisible(False)
+
+        self._repo_browse_btn = QPushButton("📂  Link Repo")
+        self._repo_browse_btn.setVisible(False)
+        self._repo_browse_btn.setStyleSheet(
+            "QPushButton { background: #1a2840; color: #90a4ae; border-radius: 6px; padding: 5px 14px;"
+            " font-size: 11px; }"
+            "QPushButton:hover { background: #1e3a5f; color: #fff; }"
+        )
+        self._repo_browse_btn.clicked.connect(self._browse_repo)
+
+        repo_row.addWidget(self._repo_path_edit, stretch=1)
+        repo_row.addWidget(self._repo_browse_btn)
+        mode_lay.addLayout(repo_row)
+
+        self._repo_hint_lbl = QLabel(
+            "Repo Watchdog builds a codebase snapshot, skips noisy folders, and can detect changed files in later debates."
+        )
+        self._repo_hint_lbl.setWordWrap(True)
+        self._repo_hint_lbl.setStyleSheet(f"color: {_PALETTE['dim']}; font-size: 10px;")
+        self._repo_hint_lbl.setVisible(False)
+        mode_lay.addWidget(self._repo_hint_lbl)
+
+        prep_row = QHBoxLayout()
+        self._repo_prep_btn = QPushButton("🧠  Analyze Repo & Fill Debate Schema")
+        self._repo_prep_btn.setVisible(False)
+        self._repo_prep_btn.setStyleSheet(
+            "QPushButton { background: #1a1040; color: #ce93d8; border-radius: 6px;"
+            " padding: 5px 12px; font-size: 11px; border: 1px solid #7e57c2; }"
+            "QPushButton:hover { background: #311b92; color: #fff; }"
+            "QPushButton:disabled { color: #546e7a; border-color: #2a3a55; }"
+        )
+        self._repo_prep_btn.clicked.connect(self._on_repo_prep_clicked)
+
+        self._repo_allow_cloud_cb = QCheckBox("Allow Cloud")
+        self._repo_allow_cloud_cb.setVisible(False)
+        self._repo_allow_cloud_cb.setChecked(False)
+        self._repo_allow_cloud_cb.setStyleSheet(
+            f"QCheckBox {{ color: {_PALETTE['dim']}; font-size: 10px; }}"
+            f"QCheckBox:checked {{ color: {_PALETTE['accent']}; }}"
+            "QCheckBox::indicator { width: 13px; height: 13px; }"
+        )
+        self._repo_allow_cloud_cb.toggled.connect(self._on_repo_cloud_toggled)
+
+        self._repo_model_combo = QComboBox()
+        self._repo_model_combo.setVisible(False)
+        self._repo_model_combo.setMinimumWidth(210)
+        self._repo_model_combo.setStyleSheet(
+            f"QComboBox {{ background: {_PALETTE['bg']}; color: {_PALETTE['text']};"
+            f" border: 1px solid {_PALETTE['border']}; border-radius: 6px; padding: 4px 8px;"
+            " font-size: 10px; }}"
+            f"QComboBox:focus {{ border-color: {_PALETTE['accent']}; }}"
+            "QComboBox QAbstractItemView { background: #0d1520; color: #dce8f5;"
+            " border: 1px solid #2a3a55; selection-background-color: #1e3a5f; }"
+        )
+
+        self._repo_prep_status = QLabel("")
+        self._repo_prep_status.setVisible(False)
+        self._repo_prep_status.setStyleSheet("color: #7e57c2; font-size: 10px; font-style: italic;")
+        prep_row.addWidget(self._repo_prep_btn)
+        prep_row.addWidget(self._repo_allow_cloud_cb)
+        prep_row.addWidget(self._repo_model_combo)
+        prep_row.addWidget(self._repo_prep_status)
+        prep_row.addStretch()
+        mode_lay.addLayout(prep_row)
+
+        right_lay.addWidget(mode_grp)
 
         # Description block
         desc_grp = QGroupBox("Topic Description & Context")
@@ -1460,7 +1566,7 @@ class TopicPickerDialog(QDialog):
         splitter.addWidget(self._transcript_panel)
         self._transcript_panel.set_splitter(splitter, 3)
 
-        # ── Topic Assistant panel (5th pane) ─────────────────────────────────
+        # ── Debate Assistant panel (5th pane) ────────────────────────────────
         self._assistant_panel = _AssistantChatPanel()
         self._assistant_panel.topic_created.connect(self._on_assistant_topic_created)
         splitter.addWidget(self._assistant_panel)
@@ -1468,89 +1574,6 @@ class TopicPickerDialog(QDialog):
         splitter.setSizes([_CARD_W + 32, 480, 280, 0, 320])
         self._main_splitter = splitter
         root.addWidget(splitter, stretch=1)
-
-        # ── Bottom bar: autonomous learning controls ─────────────────────────
-        bottom = QWidget()
-        bottom.setFixedHeight(44)
-        bottom.setStyleSheet(
-            f"background: #060b12; border-top: 1px solid {_PALETTE['border']};"
-        )
-        bl = QHBoxLayout(bottom)
-        bl.setContentsMargins(16, 0, 16, 0)
-        bl.setSpacing(12)
-
-        self._auto_cb = QCheckBox("Autonomous Learning")
-        self._auto_cb.setStyleSheet(
-            f"QCheckBox {{ color: #7e57c2; font-size: 11px; font-weight: 700; }}"
-            f"QCheckBox:checked {{ color: #ce93d8; }}"
-            f"QCheckBox::indicator {{ width: 14px; height: 14px; }}"
-        )
-        self._auto_cb.setToolTip(
-            "When enabled, the system automatically promotes recurring "
-            "lateral references (segues) into new talking points."
-        )
-        self._auto_cb.toggled.connect(self._on_auto_learning_toggled)
-        bl.addWidget(self._auto_cb)
-
-        self._auto_start_btn = QPushButton("▶ Start")
-        self._auto_start_btn.setStyleSheet(
-            "QPushButton { background: #1a2840; color: #7e57c2; border-radius: 6px;"
-            " padding: 4px 14px; font-size: 10px; border: 1px solid #2a1a3e; }"
-            "QPushButton:hover { background: #311b92; color: #fff; }"
-            "QPushButton:disabled { background: #0d1520; color: #37474f; }"
-        )
-        self._auto_start_btn.setEnabled(False)
-        self._auto_start_btn.clicked.connect(self._start_autonomous_learning)
-        bl.addWidget(self._auto_start_btn)
-
-        self._auto_stop_btn = QPushButton("■ Stop")
-        self._auto_stop_btn.setStyleSheet(
-            "QPushButton { background: #1a2840; color: #ef5350; border-radius: 6px;"
-            " padding: 4px 14px; font-size: 10px; border: 1px solid #3e1a1a; }"
-            "QPushButton:hover { background: #b71c1c; color: #fff; }"
-            "QPushButton:disabled { background: #0d1520; color: #37474f; }"
-        )
-        self._auto_stop_btn.setEnabled(False)
-        self._auto_stop_btn.clicked.connect(self._stop_autonomous_learning)
-        bl.addWidget(self._auto_stop_btn)
-
-        thresh_lbl = QLabel("Threshold:")
-        thresh_lbl.setStyleSheet(
-            f"color: {_PALETTE['dim']}; font-size: 10px; background: transparent;"
-        )
-        bl.addWidget(thresh_lbl)
-
-        self._threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self._threshold_slider.setRange(2, 10)
-        self._threshold_slider.setValue(3)
-        self._threshold_slider.setFixedWidth(100)
-        self._threshold_slider.setToolTip("Minimum mention count before a segue is promoted")
-        self._threshold_slider.setStyleSheet(
-            "QSlider::groove:horizontal { background: #1a2840; height: 4px; border-radius: 2px; }"
-            "QSlider::handle:horizontal { background: #7e57c2; width: 12px; height: 12px;"
-            " margin: -4px 0; border-radius: 6px; }"
-        )
-        bl.addWidget(self._threshold_slider)
-
-        self._threshold_val = QLabel("3")
-        self._threshold_val.setFixedWidth(18)
-        self._threshold_val.setStyleSheet(
-            "color: #7e57c2; font-size: 10px; font-weight: 700; background: transparent;"
-        )
-        self._threshold_slider.valueChanged.connect(
-            lambda v: self._threshold_val.setText(str(v))
-        )
-        bl.addWidget(self._threshold_val)
-
-        bl.addStretch()
-
-        self._auto_status = QLabel("")
-        self._auto_status.setStyleSheet(
-            f"color: {_PALETTE['dim']}; font-size: 9px; background: transparent;"
-        )
-        bl.addWidget(self._auto_status)
-
-        root.addWidget(bottom)
 
         # Select initial topic
         start_idx = next(
@@ -1560,19 +1583,189 @@ class TopicPickerDialog(QDialog):
 
     # ── Topic selection ──────────────────────────────────────────────────────
 
+    def _load_persisted_custom_debates(self) -> None:
+        self._custom_debates = self._custom_debate_store.list_all()
+
+    def _rebuild_left_cards(self) -> None:
+        if self._card_col is None:
+            return
+
+        while self._card_col.count():
+            item = self._card_col.takeAt(0)
+            if item is None:
+                continue
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self._cards.clear()
+        self._card_entries.clear()
+
+        index = 0
+        for starter_index, topic in enumerate(STARTER_TOPICS):
+            card = _TopicCard(
+                index,
+                title=topic.title,
+                description=topic.description,
+                talking_points_count=len(topic.talking_points),
+            )
+            card.clicked.connect(self._select_topic)
+            self._cards.append(card)
+            self._card_entries.append({"kind": "starter", "index": starter_index})
+            self._card_col.addWidget(card)
+            index += 1
+
+        for debate in self._custom_debates:
+            is_repo = debate.mode == "repo_watchdog" and bool((debate.repo_path or "").strip())
+            card = _TopicCard(
+                index,
+                title=debate.title,
+                description=debate.description,
+                talking_points_count=len(debate.talking_points),
+                repo_mode=is_repo,
+                deletable=True,
+                debate_id=debate.id,
+            )
+            card.clicked.connect(self._select_topic)
+            card.delete_requested.connect(self._delete_custom_debate)
+            self._cards.append(card)
+            self._card_entries.append({"kind": "custom", "id": debate.id})
+            self._card_col.addWidget(card)
+            index += 1
+
+        self._card_col.addStretch()
+
+    def _find_custom_debate(self, debate_id: str) -> CustomDebate | None:
+        for debate in self._custom_debates:
+            if debate.id == debate_id:
+                return debate
+        return None
+
+    def _delete_custom_debate(self, debate_id: str) -> None:
+        debate = self._find_custom_debate(debate_id)
+        title = debate.title if debate is not None else "this debate"
+        reply = QMessageBox.warning(
+            self,
+            "Delete Debate Widget",
+            f"Delete '{title}' from your saved debate widgets?\n\n"
+            "This removes the saved custom debate entry.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted = self._custom_debate_store.delete(debate_id)
+        if not deleted:
+            QMessageBox.warning(
+                self,
+                "Delete Debate Widget",
+                "Could not delete the selected debate widget.",
+            )
+            return
+
+        if self._active_custom_id == debate_id:
+            self._active_custom_id = None
+
+        self._load_persisted_custom_debates()
+        self._rebuild_left_cards()
+
+        fallback_idx = next(
+            (i for i, entry in enumerate(self._card_entries)
+             if entry.get("kind") == "starter" and STARTER_TOPICS[int(entry.get("index", 0))].title == "Custom Debate"),
+            0,
+        )
+        self._select_topic(fallback_idx)
+
+    def _select_custom_card_by_id(self, debate_id: str) -> None:
+        for idx, entry in enumerate(self._card_entries):
+            if entry.get("kind") == "custom" and entry.get("id") == debate_id:
+                self._select_topic(idx)
+                return
+
+    def _upsert_current_custom_debate(self) -> CustomDebate | None:
+        title = self._custom_title_edit.text().strip()
+        if not title:
+            return None
+
+        description = self._desc_edit.toPlainText().strip()
+        tps = [ln.strip() for ln in self._tp_edit.toPlainText().split("\n") if ln.strip()]
+        repo_mode = self._mode_repo_rb.isChecked()
+        repo_path = self._repo_path_edit.text().strip() if repo_mode else ""
+
+        payload = CustomDebate(
+            id=self._active_custom_id or "",
+            title=title,
+            description=description,
+            talking_points=tps,
+            mode="repo_watchdog" if repo_mode else "static_ingestion",
+            repo_path=repo_path,
+        )
+        saved = self._custom_debate_store.upsert(
+            debate_id=payload.id,
+            title=payload.title,
+            description=payload.description,
+            talking_points=payload.talking_points,
+            mode=payload.mode,
+            repo_path=payload.repo_path,
+        )
+        self._active_custom_id = saved.id
+        self._load_persisted_custom_debates()
+        self._rebuild_left_cards()
+        self._select_custom_card_by_id(saved.id)
+        return saved
+
     def _select_topic(self, index: int) -> None:
-        # Clear autonomous selection
-        self._selected_auto_filename = ""
-        for c in self._auto_cards:
-            c.set_selected(False)
+        if index < 0 or index >= len(self._card_entries):
+            return
 
         for i, card in enumerate(self._cards):
             card.set_selected(i == index)
         self._selected_index = index
-        topic = STARTER_TOPICS[index]
-        is_custom = topic.title == "Custom Topic"
+
+        entry = self._card_entries[index]
+        if entry.get("kind") == "custom":
+            debate = self._find_custom_debate(entry.get("id", ""))
+            if debate is None:
+                return
+
+            self._active_custom_id = debate.id
+            self._preset_title_lbl.setVisible(False)
+            self._custom_mode_group.setVisible(True)
+            self._custom_title_edit.setVisible(True)
+            self._custom_title_edit.setText(debate.title)
+            self._desc_edit.setReadOnly(False)
+            self._tp_edit.setReadOnly(False)
+            self._desc_edit.setPlainText(debate.description)
+            self._tp_edit.setPlainText("\n".join(debate.talking_points))
+            self._repo_path_edit.setText(debate.repo_path or "")
+            self._repo_schema_generated_once = bool(debate.description or debate.talking_points)
+
+            if debate.mode == "repo_watchdog":
+                self._mode_repo_rb.setChecked(True)
+            else:
+                self._mode_static_rb.setChecked(True)
+            self._on_custom_mode_changed()
+
+            first_tp_line = (debate.talking_points[0] if debate.talking_points else "").strip()
+            self._current_tp_key = _tp_key(debate.title, first_tp_line)
+            self._confirm_btn.setText("▶  Start Custom Debate")
+            pts = len(debate.talking_points)
+            suffix = "  ·  repo linked" if debate.mode == "repo_watchdog" else ""
+            self._topic_badge.setText(f"  {pts} talking points{suffix}" if pts else suffix)
+
+            if self._history_panel is not None and self._current_tp_key:
+                self._history_panel.load_sessions(self._current_tp_key)
+            elif self._history_panel is not None:
+                self._history_panel.load_sessions("")
+            return
+
+        starter_index = int(entry.get("index", 0))
+        topic = STARTER_TOPICS[starter_index]
+        is_custom = topic.title == "Custom Debate"
 
         self._preset_title_lbl.setVisible(not is_custom)
+        self._custom_mode_group.setVisible(is_custom)
         # Reset title label color to default accent
         self._preset_title_lbl.setStyleSheet(
             f"color: {_PALETTE['accent']}; background: transparent;"
@@ -1581,8 +1774,11 @@ class TopicPickerDialog(QDialog):
 
         # Compute default tp_key from the first talking point (or topic title for custom)
         if is_custom:
+            self._active_custom_id = None
+            self._repo_schema_generated_once = False
             self._current_tp_key = ""
             self._custom_title_edit.setText("")
+            self._repo_path_edit.setText("")
             self._desc_edit.setReadOnly(False)
             self._tp_edit.setReadOnly(False)
             self._desc_edit.setPlainText("")
@@ -1598,8 +1794,10 @@ class TopicPickerDialog(QDialog):
                 "Is consciousness purely physical or is there something irreducibly subjective?\n"
                 "If determinism is true, can moral responsibility exist?"
             )
-            self._confirm_btn.setText("▶  Start Custom Topic")
+            self._confirm_btn.setText("▶  Start Custom Debate")
+            self._on_custom_mode_changed()
         else:
+            self._active_custom_id = None
             self._preset_title_lbl.setText(topic.title)
             self._desc_edit.setReadOnly(False)
             self._tp_edit.setReadOnly(False)
@@ -1624,6 +1822,8 @@ class TopicPickerDialog(QDialog):
 
             self._tp_edit.setPlainText(tp_text)
             self._confirm_btn.setText("▶  Start This Topic")
+            self._mode_static_rb.setChecked(True)
+            self._on_custom_mode_changed()
 
         pts = len(topic.talking_points) if not is_custom else 0
         self._topic_badge.setText(f"  {pts} talking points" if pts else "")
@@ -1697,6 +1897,193 @@ class TopicPickerDialog(QDialog):
     def _clear_files(self) -> None:
         self._queued_files.clear()
         self._file_list.clear()
+
+    def _browse_repo(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select repository folder")
+        if folder:
+            self._repo_path_edit.setText(folder)
+
+    def _on_custom_mode_changed(self) -> None:
+        is_repo_mode = self._mode_repo_rb.isChecked() and self._custom_title_edit.isVisible()
+        self._repo_path_edit.setVisible(is_repo_mode)
+        self._repo_browse_btn.setVisible(is_repo_mode)
+        self._repo_hint_lbl.setVisible(is_repo_mode)
+        self._repo_prep_btn.setVisible(is_repo_mode)
+        self._repo_allow_cloud_cb.setVisible(is_repo_mode)
+        self._repo_model_combo.setVisible(is_repo_mode)
+        self._repo_prep_status.setVisible(is_repo_mode)
+        if is_repo_mode:
+            self._load_repo_prep_models(fetch=True)
+
+    def _on_repo_cloud_toggled(self, _checked: bool) -> None:
+        self._load_repo_prep_models(fetch=False)
+
+    @staticmethod
+    def _is_cloud_model_name(name: str) -> bool:
+        lower = name.lower().strip()
+        if ":" in lower:
+            tag = lower.split(":", 1)[1]
+            if "cloud" in tag:
+                return True
+        return lower.endswith("-cloud")
+
+    def _load_repo_prep_models(self, *, fetch: bool = False) -> None:
+        previous = self._repo_model_combo.currentData()
+        if fetch or not self._repo_all_models:
+            try:
+                import httpx
+                resp = httpx.get("http://localhost:11434/api/tags", timeout=12.0)
+                resp.raise_for_status()
+                data = resp.json()
+                models = [
+                    str(m.get("name", "")).strip()
+                    for m in data.get("models", [])
+                    if str(m.get("name", "")).strip()
+                ]
+                self._repo_all_models = sorted(set(models))
+            except Exception:
+                self._repo_all_models = []
+
+        try:
+            from config.model_prefs import load_model_prefs
+            fallback_model = load_model_prefs().get("right_model", "qwen3:30b") or "qwen3:30b"
+        except Exception:
+            fallback_model = "qwen3:30b"
+
+        if not self._repo_all_models:
+            self._repo_all_models = [fallback_model]
+
+        allow_cloud = self._repo_allow_cloud_cb.isChecked()
+        local_models = [m for m in self._repo_all_models if not self._is_cloud_model_name(m)]
+        cloud_models = [m for m in self._repo_all_models if self._is_cloud_model_name(m)]
+        pool = (local_models + cloud_models) if allow_cloud else local_models
+        if not pool:
+            pool = [fallback_model]
+
+        self._repo_model_combo.blockSignals(True)
+        self._repo_model_combo.clear()
+        for model in pool:
+            prefix = "☁ " if self._is_cloud_model_name(model) else "💻 "
+            self._repo_model_combo.addItem(f"{prefix}{model}", model)
+
+        target = previous if previous in pool else fallback_model
+        idx = self._repo_model_combo.findData(target)
+        if idx < 0 and self._repo_model_combo.count() > 0:
+            idx = 0
+        if idx >= 0:
+            self._repo_model_combo.setCurrentIndex(idx)
+        self._repo_model_combo.blockSignals(False)
+
+    def _on_repo_prep_clicked(self) -> None:
+        if self._repo_schema_worker is not None and self._repo_schema_worker.isRunning():
+            return
+
+        if self._repo_schema_generated_once:
+            reply = QMessageBox.question(
+                self,
+                "Rewrite Repo Prep Data",
+                "Are you sure you want to rewrite all generated repo prep data?\n\n"
+                "This will replace the current title, description, and talking points.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        repo_path = Path(self._repo_path_edit.text().strip())
+        if not repo_path.exists() or not repo_path.is_dir():
+            QMessageBox.warning(
+                self,
+                "Repo Watchdog",
+                "Choose a valid repository folder before running repo prep.",
+            )
+            return
+
+        try:
+            size_bytes = self._repo_watchdog.estimate_repo_size_bytes(str(repo_path))
+        except Exception:
+            size_bytes = 0
+        if size_bytes >= 3 * 1024 * 1024 * 1024:
+            size_gb = size_bytes / (1024 ** 3)
+            reply = QMessageBox.warning(
+                self,
+                "Large Repository",
+                f"This repository is approximately {size_gb:.2f} GB of included files.\n\n"
+                "Building the semantic dataset may be memory and time intensive.\n"
+                "Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        try:
+            snapshot = self._repo_watchdog.build_snapshot(str(repo_path))
+            brief = self._repo_watchdog.build_context_brief(snapshot)
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Repo Watchdog",
+                f"Failed to build repository snapshot for prep:\n{exc}",
+            )
+            return
+
+        selected_model = self._repo_model_combo.currentData()
+        model = str(selected_model).strip() if selected_model else "qwen3:30b"
+
+        self._repo_prep_btn.setEnabled(False)
+        self._repo_prep_status.setText(f"Preparing debate schema with {model}…")
+
+        self._repo_schema_worker = _RepoSchemaWorker(
+            repo_path=str(repo_path.resolve()),
+            repo_brief=brief,
+            model=model,
+            parent=self,
+        )
+        self._repo_schema_worker.finished.connect(self._on_repo_prep_done)
+        self._repo_schema_worker.failed.connect(self._on_repo_prep_failed)
+        self._repo_schema_worker.start()
+
+    def _on_repo_prep_done(self, result: dict) -> None:
+        self._repo_prep_btn.setEnabled(True)
+        self._repo_schema_generated_once = True
+
+        title = result.get("title", "").strip()
+        description = result.get("description", "").strip()
+        tps = result.get("talking_points", [])
+        prep_schema = result.get("prep_schema", {})
+
+        schema_lines: list[str] = []
+        if isinstance(prep_schema, dict):
+            labels = [
+                ("modules_to_probe", "Modules to Probe"),
+                ("risky_areas", "Risky Areas"),
+                ("evidence_checklist", "Evidence Checklist"),
+                ("watch_signals", "Watch Signals"),
+            ]
+            for key, label in labels:
+                values = prep_schema.get(key, [])
+                if isinstance(values, list) and values:
+                    schema_lines.append(f"{label}:")
+                    schema_lines.extend(f"- {str(v).strip()}" for v in values[:8] if str(v).strip())
+                    schema_lines.append("")
+
+        if title:
+            self._custom_title_edit.setText(title)
+        if description:
+            final_desc = description
+            if schema_lines:
+                final_desc += "\n\nDEBATE PREP SCHEMA:\n" + "\n".join(schema_lines).strip()
+            self._desc_edit.setPlainText(final_desc)
+        if tps:
+            self._tp_edit.setPlainText("\n".join(str(tp).strip() for tp in tps if str(tp).strip()))
+
+        self._upsert_current_custom_debate()
+        self._repo_prep_status.setText("✓ Repo schema ready — review and start debate")
+
+    def _on_repo_prep_failed(self, error: str) -> None:
+        self._repo_prep_btn.setEnabled(True)
+        self._repo_prep_status.setText(f"✗ {error[:100]}")
 
     # ── AI Rewrite ───────────────────────────────────────────────────────────
 
@@ -1777,177 +2164,35 @@ class TopicPickerDialog(QDialog):
         self._rewrite_btn.setEnabled(True)
         self._rewrite_status.setText(f"✗ {error[:80]}")
 
-    # ── Autonomous learning helpers ────────────────────────────────────────
-
-    def _refresh_auto_cards(self) -> None:
-        """Rebuild the autonomous topic card list in the left column."""
-        # Remove old cards
-        for c in self._auto_cards:
-            c.setParent(None)
-            c.deleteLater()
-        self._auto_cards.clear()
-
-        store = get_autonomous_store()
-        topics = store.load_all(include_deleted=False)
-
-        self._auto_divider.setVisible(bool(topics))
-
-        for at in topics:
-            card = _AutonomousTopicCard(at)
-            card.clicked.connect(self._select_auto_topic)
-            card.delete_requested.connect(self._delete_auto_topic)
-            self._auto_cards.append(card)
-            self._auto_card_container.addWidget(card)
-
-    def _select_auto_topic(self, filename: str) -> None:
-        """Select an autonomous topic and populate the detail panel."""
-        # Deselect all starter cards
-        for c in self._cards:
-            c.set_selected(False)
-        # Select this auto card
-        self._selected_auto_filename = filename
-        for c in self._auto_cards:
-            c.set_selected(c._filename == filename)
-
-        store = get_autonomous_store()
-        at = store.get_by_filename(filename)
-        if at is None:
-            return
-
-        # Switch to autonomous topic view
-        self._preset_title_lbl.setVisible(True)
-        self._custom_title_edit.setVisible(False)
-        self._preset_title_lbl.setText(f"✦ {at.title}")
-        self._preset_title_lbl.setStyleSheet(
-            "color: #ce93d8; background: transparent;"
-        )
-        self._desc_edit.setReadOnly(False)
-        self._tp_edit.setReadOnly(False)
-        self._desc_edit.setPlainText(at.description)
-        tp_text = "\n\n".join(at.talking_points)
-        self._tp_edit.setPlainText(tp_text)
-        self._confirm_btn.setText("▶  Start Autonomous Topic")
-
-        pts = len(at.talking_points)
-        origin_text = f"  (segue: {at.segue_concept})" if at.segue_concept else ""
-        self._topic_badge.setText(
-            f"  {pts} talking points  ·  autonomous{origin_text}"
-        )
-
-        # Compute tp_key for session history
-        first_tp = at.talking_points[0] if at.talking_points else ""
-        self._current_tp_key = _tp_key(at.title, first_tp)
-        if self._history_panel is not None and self._current_tp_key:
-            self._history_panel.load_sessions(self._current_tp_key)
-
-    def _delete_auto_topic(self, filename: str) -> None:
-        """Soft-delete an autonomous topic and refresh cards."""
-        store = get_autonomous_store()
-        store.delete(filename)
-        self._refresh_auto_cards()
-
     def _on_assistant_topic_created(self, result: dict) -> None:
-        """Handle a Topic created by the assistant chatbot."""
-        store = get_autonomous_store()
-        store.save(result)
-        self._refresh_auto_cards()
-
-    def _on_auto_learning_toggled(self, checked: bool) -> None:
-        self._autonomous_learning_enabled = checked
-        self._auto_start_btn.setEnabled(checked)
-        if not checked:
-            self._stop_autonomous_learning()
-
-    def _start_autonomous_learning(self) -> None:
-        """Kick off autonomous promotion: scan segue buffer and create TPs."""
-        if self._promotion_worker is not None and self._promotion_worker.isRunning():
+        title = str(result.get("title", "")).strip()
+        if not title:
             return
-
-        from agents.topic_assistant_worker import AutonomousPromotionWorker
-        from config.model_prefs import load_model_prefs
-        from config.starter_topics import get_topic_titles
-
-        try:
-            model = load_model_prefs().get("right_model", "qwen3:30b") or "qwen3:30b"
-        except Exception:
-            model = "qwen3:30b"
-
-        existing = get_topic_titles() + get_autonomous_store().titles()
-        threshold = self._threshold_slider.value()
-
-        self._promotion_worker = AutonomousPromotionWorker(
-            model=model,
-            existing_titles=existing,
-            threshold=threshold,
-            parent=self,
+        description = str(result.get("description", "")).strip()
+        tps = [str(tp).strip() for tp in result.get("talking_points", []) if str(tp).strip()]
+        saved = self._custom_debate_store.upsert(
+            debate_id="",
+            title=title,
+            description=description,
+            talking_points=tps,
+            mode="static_ingestion",
+            repo_path="",
         )
-        self._promotion_worker.promoted.connect(self._on_auto_promoted)
-        self._promotion_worker.progress.connect(
-            lambda msg: self._auto_status.setText(msg)
-        )
-        self._promotion_worker.all_done.connect(self._on_auto_all_done)
-        self._promotion_worker.failed.connect(
-            lambda err: self._auto_status.setText(f"✗ {err[:60]}")
-        )
-        self._promotion_worker.start()
+        self._load_persisted_custom_debates()
+        self._rebuild_left_cards()
+        self._select_custom_card_by_id(saved.id)
 
-        self._auto_start_btn.setEnabled(False)
-        self._auto_stop_btn.setEnabled(True)
-        self._auto_status.setText("Scanning segue buffer…")
-
-    def _stop_autonomous_learning(self) -> None:
-        if self._promotion_worker is not None and self._promotion_worker.isRunning():
-            self._promotion_worker.request_stop()
-        self._auto_start_btn.setEnabled(self._autonomous_learning_enabled)
-        self._auto_stop_btn.setEnabled(False)
-        self._auto_status.setText("Stopped")
-
-    def _on_auto_promoted(self, result: dict) -> None:
-        store = get_autonomous_store()
-        store.save(result)
-        self._refresh_auto_cards()
-        title = result.get("title", "?")
-        self._auto_status.setText(f"Created: {title[:40]}")
-
-    def _on_auto_all_done(self, count: int) -> None:
-        self._auto_start_btn.setEnabled(self._autonomous_learning_enabled)
-        self._auto_stop_btn.setEnabled(False)
-        self._auto_status.setText(
-            f"✓ Done — {count} topic{'s' if count != 1 else ''} created"
-        )
-
-    # ── Confirm (updated for autonomous topics) ─────────────────────────────
+    # ── Confirm ──────────────────────────────────────────────────────────────
 
     def _on_confirm(self) -> None:
-        # Check if an autonomous topic is selected
-        if self._selected_auto_filename:
-            store = get_autonomous_store()
-            at = store.get_by_filename(self._selected_auto_filename)
-            if at is not None:
-                title = at.title
-                desc = self._desc_edit.toPlainText().strip()
-                tp_raw = self._tp_edit.toPlainText().strip()
-                tp_lines = [ln.strip() for ln in tp_raw.split("\n") if ln.strip()]
-                if tp_lines:
-                    tp_block = (
-                        "\n\nKEY TALKING POINTS — anchor every argument to these:\n"
-                        + "\n".join(f"  • {ln}" for ln in tp_lines)
-                    )
-                else:
-                    tp_block = ""
-                full_context = f"{title}\n\n{desc}{tp_block}".strip()
-                files = (
-                    [str(f) for f in self._queued_files]
-                    if self._use_ingest_cb.isChecked()
-                    else []
-                )
-                self.topic_confirmed.emit(title, full_context, files)
-                self.accept()
-                return
-
-        # Original logic for starter topics
-        topic = STARTER_TOPICS[self._selected_index]
-        is_custom = topic.title == "Custom Topic"
+        entry = self._card_entries[self._selected_index] if self._card_entries else {"kind": "starter", "index": 0}
+        topic = None
+        is_custom = False
+        if entry.get("kind") == "starter":
+            topic = STARTER_TOPICS[int(entry.get("index", 0))]
+            is_custom = topic.title == "Custom Debate"
+        else:
+            is_custom = True
 
         if is_custom:
             title = self._custom_title_edit.text().strip()
@@ -1959,7 +2204,9 @@ class TopicPickerDialog(QDialog):
                 return
             first_tp_line = (self._tp_edit.toPlainText().strip().split("\n")[0]).strip()
             self._current_tp_key = _tp_key(title, first_tp_line)
+            self._upsert_current_custom_debate()
         else:
+            assert topic is not None
             title = topic.title
 
         desc = self._desc_edit.toPlainText().strip()
@@ -1980,6 +2227,60 @@ class TopicPickerDialog(QDialog):
             tp_block = ""
 
         full_context = f"{title}\n\n{desc}{tp_block}".strip()
+
+        if is_custom and self._mode_repo_rb.isChecked():
+            repo_path = Path(self._repo_path_edit.text().strip())
+            if not repo_path.exists() or not repo_path.is_dir():
+                QMessageBox.warning(
+                    self,
+                    "Repo Watchdog",
+                    "Choose a valid repository folder before starting this custom debate.",
+                )
+                return
+
+            try:
+                size_bytes = self._repo_watchdog.estimate_repo_size_bytes(str(repo_path))
+            except Exception:
+                size_bytes = 0
+            if size_bytes >= 3 * 1024 * 1024 * 1024:
+                size_gb = size_bytes / (1024 ** 3)
+                reply = QMessageBox.warning(
+                    self,
+                    "Large Repository",
+                    f"This repository is approximately {size_gb:.2f} GB of included files.\n\n"
+                    "Starting a repo-linked debate will build/refresh a large semantic dataset.\n"
+                    "Continue anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+            try:
+                snapshot = self._repo_watchdog.build_snapshot(str(repo_path))
+                brief = self._repo_watchdog.build_context_brief(snapshot)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    "Repo Watchdog",
+                    f"Failed to build repository snapshot:\n{exc}",
+                )
+                return
+
+            full_context = (
+                f"{full_context}\n\n"
+                "REPO MODE: This debate is linked to a live repository.\n"
+                "Use the repository snapshot for global understanding, then inspect real files for final claims.\n\n"
+                f"{brief}"
+            )
+
+            marker = {
+                "mode": "repo_watchdog",
+                "repo_path": str(repo_path.resolve()),
+                "snapshot_generated_at": snapshot.generated_at,
+            }
+            full_context += f"\n\n[REPO_WATCHDOG_META]{json.dumps(marker)}[/REPO_WATCHDOG_META]"
+
         files = (
             [str(f) for f in self._queued_files]
             if self._use_ingest_cb.isChecked()

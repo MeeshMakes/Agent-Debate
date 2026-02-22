@@ -185,9 +185,43 @@ STARTER_TOPICS: list[StarterTopic] = [
         ],
     ),
 
+        talking_points=[
+            "The container-based architecture promises clean separation but some containers "
+            "have leaked dependencies or missing README contracts — which containers need "
+            "restructuring, and what does a properly self-documenting container API look like "
+            "in practice for this codebase?",
+
+            "The VS Code bridge is a critical integration point but may have race conditions, "
+            "missing error handling, or incomplete message schemas — what specific improvements "
+            "would make the bridge robust enough for real-time bidirectional communication "
+            "between the PyQt6 app and VS Code?",
+
+            "The agent system and tool registry need to work together seamlessly — are there "
+            "missing tool implementations, broken dispatch paths, or tool registration patterns "
+            "that should be refactored to make tool execution reliable and extensible?",
+
+            "Memory and persistence systems (macros, conversation history, semantic memory) "
+            "appear partially implemented — what is missing, what is structurally wrong, and "
+            "how should persistent memory be architected so the agent actually learns and "
+            "remembers across sessions?",
+
+            "The self-evolution subsystem exists in skeleton form — what concrete, safe "
+            "self-modification capabilities should be built next, and how do you prevent "
+            "the agent from breaking itself while still allowing it to improve its own code?",
+
+            "The UI layer (PyQt6 widgets, chat panel, response rendering) needs to be both "
+            "beautiful and functional — are there rendering bugs, missing widget features, "
+            "or UX patterns that should be added to make the IDE feel responsive and professional?",
+
+            "Looking at the overall codebase quality: naming conventions, dead code, duplicated "
+            "logic, missing type hints, inconsistent error handling — what are the highest-impact "
+            "refactoring targets that would make the whole system more maintainable and correct?",
+        ],
+    ),
+
     StarterTopic(
-        title="Custom Topic",
-        description="Enter your own debate topic below.",
+        title="Custom Debate",
+        description="Create your own debate brief or link a repository with Repo Watchdog.",
         talking_points=[],
     ),
 ]

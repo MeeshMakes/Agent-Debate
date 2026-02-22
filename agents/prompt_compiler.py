@@ -99,6 +99,8 @@ def compile_persona_prompt(
     living_topic_doc: str = "",
     resolution_context: str = "",
     macro_store: DebateMacroStore | None = None,
+    dataset_context: str = "",
+    focus_guidance: str = "",
 ) -> str:
     soul = _SOULS.get(
         name,
@@ -178,6 +180,40 @@ def compile_persona_prompt(
     if resolution_context and resolution_context.strip():
         res_block = f"\n{resolution_context}"
 
+    # Dataset knowledge block (ingested codebase / uploaded files)
+    ds_block = ""
+    if dataset_context and dataset_context.strip():
+        ds_block = (
+            "\n\n———— UPLOADED DATASET KNOWLEDGE — treat this as your deep reading ————\n"
+            "You have been given access to an ingested codebase / document set.\n"
+            "For software/system debates, follow this analysis order:\n"
+            "1) understand core executable scripts/modules first\n"
+            "2) map cross-script integration (who calls what, data/control flow, runtime boundaries)\n"
+            "3) articulate the overall system vision/architecture before final judgments\n"
+            "4) then deep-dive on specific problematic scripts, loops, and failure paths\n"
+            "5) include both strengths (what works) and weaknesses (what breaks) with improvements\n"
+            "Read these chunks carefully and reference specific files, functions,\n"
+            "patterns, and code structures in your arguments. Cite the source file\n"
+            "when making claims about the code. Propose concrete improvements,\n"
+            "refactoring ideas, and missing features based on what you see here.\n"
+            "Do NOT just summarise — analyse, critique, and suggest actionable changes.\n\n"
+            f"{dataset_context}\n"
+            "————————————————————————————————————————————————————————————————————\n"
+        )
+
+    # Focus-balance analytics loop (yin-yang: broad vs hyper)
+    focus_block = ""
+    if focus_guidance and focus_guidance.strip():
+        focus_block = (
+            "\n\n———— FOCUS BALANCE ANALYTICS (YIN-YANG LOOP) ————\n"
+            f"{focus_guidance.strip()}\n"
+            "Use this guidance to regulate analysis granularity this turn.\n"
+            "If asked to zoom out, produce system-level synthesis.\n"
+            "If asked to zoom in, produce script/function-level precision.\n"
+            "Never stay in one mode for too many consecutive turns.\n"
+            "————————————————————————————————————————————————————————————\n"
+        )
+
     # Stats-driven urgency line
     stats = adaptive_store.get_stats(topic)
     urgency_line = _build_urgency_line(stats)
@@ -185,7 +221,7 @@ def compile_persona_prompt(
     prompt = f"""{soul}{macro_block}
 DEBATE TOPIC: {topic}
 YOUR CURRENT FOCAL POINT: {talking_point}
-{urgency_line}{mem_block}{adaptive_section}{sub_block}{anchor_block}{bias_block}{conv_block}{living_block}{res_block}
+{urgency_line}{mem_block}{adaptive_section}{sub_block}{anchor_block}{bias_block}{conv_block}{living_block}{res_block}{ds_block}{focus_block}
 
 ———— THINK-TANK ETHOS — read before writing a single word ————
 

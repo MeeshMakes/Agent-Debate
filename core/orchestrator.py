@@ -9,6 +9,7 @@ from typing import Callable
 from agents.persona_agent import PersonaAgent
 from core.arbiter_engine import ArbiterEngine
 from core.debate_quality import DebateQuality, detect_echo, detect_cross_echo
+from core.focus_balance import FocusBalanceTracker
 from core.session_manager import SessionManager
 from core.state_machine import DebateState, DebateStateMachine
 from core.turn_scheduler import TurnScheduler
@@ -22,6 +23,7 @@ from memory.living_topic import LivingTopic
 from memory.private_memory import PrivateMemory
 from memory.resolution_store import ResolutionStore, get_resolution_store
 from memory.shared_memory import SharedMemory
+from ingestion.dataset_context import DatasetContextProvider
 
 
 @dataclass
@@ -76,6 +78,8 @@ class DebateOrchestrator:
         self._resolution_store: ResolutionStore = get_resolution_store()
         self._turn_index: int = 0   # persists across continue_debate calls
         self._agent_recent_msgs: dict[str, list[str]] = {}  # name → last 3 messages
+        self._dataset_provider = DatasetContextProvider()
+        self._focus_tracker = FocusBalanceTracker(window_size=6)
 
     def subscribe(self, listener: Callable[[DebateEvent], None]) -> None:
         self._listeners.append(listener)
@@ -83,6 +87,18 @@ class DebateOrchestrator:
     def stop(self) -> None:
         self._stop_requested = True
         self._pause_gate.set()    # open the gate so the blocked loop can exit
+
+    def load_dataset(self, facts: list[dict], name: str = "") -> None:
+        """Load ingested dataset facts so agents can reference them.
+        Thread-safe: can be called from the main thread while the debate runs.
+        """
+        self._dataset_provider.load_facts(facts, name)
+
+    def load_dataset_from_session(self) -> bool:
+        """Attempt to load the ingested dataset from the current session dir."""
+        if self._session_manager and self._session_manager.current_path:
+            return self._dataset_provider.load_from_session(self._session_manager.current_path)
+        return False
 
     def pause(self) -> None:
         """Request a pair-aware pause — honoured only after both agents finish a pair."""
@@ -239,6 +255,7 @@ class DebateOrchestrator:
         self._sub_topics_explored = []
         self._turn_index = 0
         self._pair_count = 0
+        self._focus_tracker.reset()
 
         # Initialise living topic from seed
         self._living_topic = LivingTopic(seed=topic)
@@ -326,6 +343,22 @@ class DebateOrchestrator:
                     f"{topic} {self._active_talking_point_label}"
                 )
 
+                # Dataset context — if an ingested dataset is available, pull
+                # relevant chunks for this agent's current focal point
+                ds_context = ""
+                if self._dataset_provider.loaded:
+                    ds_query = f"{topic} {self._active_talking_point_label} {opponent_last[:200]}"
+                    ds_context = self._dataset_provider.get_context(
+                        query=ds_query,
+                        agent_name=current_speaker.name,
+                        top_k=12,
+                        max_chars=4000,
+                    )
+
+                focus_guidance = self._focus_tracker.build_guidance(
+                    talking_point=self._active_talking_point_label,
+                )
+
                 # -- THINK phase --
                 thought = await current_speaker.think(
                     topic=topic,
@@ -334,6 +367,8 @@ class DebateOrchestrator:
                     conversation_window=conversation_window,
                     living_topic_doc=living_doc,
                     resolution_context=res_context,
+                    dataset_context=ds_context,
+                    focus_guidance=focus_guidance,
                 )
                 current_private.add_thought(thought)
 
@@ -359,6 +394,8 @@ class DebateOrchestrator:
                     conversation_window=conversation_window,
                     living_topic_doc=living_doc,
                     resolution_context=res_context,
+                    dataset_context=ds_context,
+                    focus_guidance=focus_guidance,
                 )
 
                 # -- Parse all signal types --
@@ -433,6 +470,11 @@ class DebateOrchestrator:
                     message=full_message_for_memory,
                     recent_messages=self.shared_memory.recent_messages(),
                 )
+                focus_snapshot = self._focus_tracker.observe_turn(
+                    message=message,
+                    talking_point=self._active_talking_point_label,
+                    citations=evidence_citations,
+                )
 
                 res_stats = self._resolution_store.stats
                 self._emit(
@@ -454,27 +496,18 @@ class DebateOrchestrator:
                         "memory_facts": len(current_speaker.semantic_memory.facts),
                         "living_topic_summary": self._living_topic.summary_line() if self._living_topic else "",
                         "resolution_stats": res_stats,
+                        "focus_analytics": {
+                            "mode": focus_snapshot.mode,
+                            "recommended_next_mode": focus_snapshot.recommended_next_mode,
+                            "broad_turns": focus_snapshot.broad_turns,
+                            "hyper_turns": focus_snapshot.hyper_turns,
+                            "balanced_turns": focus_snapshot.balanced_turns,
+                            "window_size": focus_snapshot.window_size,
+                            "dominant_file": focus_snapshot.dominant_file,
+                        },
                     },
                 )
                 self.telemetry.bump_turn()
-
-                # -- Segue detection — log lateral references to segue buffer --
-                if turn_index >= 2:
-                    try:
-                        from core.segue_buffer import get_segue_buffer, extract_concepts
-                        sess_id = ""
-                        if self._session_manager and self._session_manager.current_session:
-                            sess_id = self._session_manager.current_session.session_id
-                        concepts = extract_concepts(message)
-                        sbuf = get_segue_buffer()
-                        for concept, context in concepts:
-                            sbuf.log_segue(
-                                concept, sess_id, turn_index,
-                                current_speaker.name,
-                                self._active_talking_point_label, context,
-                            )
-                    except Exception:
-                        pass   # never break the debate loop
 
                 # -- Arbiter --
                 decision = self.arbiter.evaluate(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import escape
+import re
 from urllib.parse import quote
 
 try:
@@ -122,9 +123,12 @@ class CenterDebatePanel(QWidget):
         self._message_positions: list[tuple[int, int]] = []
         # Cleaned text (TTS version) for each message — used for word search
         self._cleaned_texts: list[str] = []
+        # Lazy per-message map from cleaned-text char index -> document-local char index
+        self._clean_to_doc_maps: list[list[int] | None] = []
         # Per-message search cursor: where to start the next find() from
         self._word_search_pos: int = 0
         self._word_search_msg: int = -1
+        self._last_tts_char_offset: int = -1
         # The QTextCursor covering the currently orange word
         self._word_cursor: QTextCursor | None = None
         self._word_cursor_fmt: QTextCharFormat | None = None  # saved pre-highlight format
@@ -150,10 +154,12 @@ class CenterDebatePanel(QWidget):
             self.follow_mode_changed.emit(enabled)
 
     def _on_user_scroll(self) -> None:
-        """Mouse-wheel detected — break follow mode silently."""
-        if self._follow_mode:
-            self._follow_mode = False
-            self.follow_mode_changed.emit(False)
+        """Mouse-wheel detected.
+
+        Follow mode is controlled explicitly by the Follow Text toggle button;
+        wheel movement should not disable it.
+        """
+        return
 
     def _on_anchor_clicked(self, url: QUrl) -> None:
         if url.scheme() != "source":
@@ -170,9 +176,11 @@ class CenterDebatePanel(QWidget):
         self._messages.clear()
         self._message_positions.clear()
         self._cleaned_texts.clear()
+        self._clean_to_doc_maps.clear()
         self._highlighted_idx = -1
         self._word_cursor = None
         self._word_cursor_fmt = None
+        self._last_tts_char_offset = -1
         self._turn_indicator.setText("")
 
     def update_turn_indicator(self, speaker: str, turn: int, total_turns: int = 0) -> None:
@@ -197,9 +205,6 @@ class CenterDebatePanel(QWidget):
             f"<span style='color:#546e7a;'>  ·  </span>"
             f"<span style='color:#90a4ae; font-weight:600;'>{turn_text}</span>"
         )
-        self._word_search_pos = 0
-        self._word_search_msg = -1
-        self.public_view.clear()
 
     def append_message(
         self,
@@ -215,6 +220,7 @@ class CenterDebatePanel(QWidget):
         color = AGENT_COLORS.get(speaker, "#e0e0e0")
         self._messages.append((speaker, text))
         self._cleaned_texts.append(TTSPlaybackWorker.clean_text(text))
+        self._clean_to_doc_maps.append(None)
 
         # --- Build full HTML for the message block ---
 
@@ -366,12 +372,45 @@ class CenterDebatePanel(QWidget):
         """Called when TTS starts a new message — resets word search, scrolls if following."""
         # Clear the previous orange word
         self._clear_word_cursor()
+        self.set_follow_mode(True)
         self._highlighted_idx = index
         self._word_search_msg = index
+        self._last_tts_char_offset = -1
         if 0 <= index < len(self._message_positions):
             self._word_search_pos = self._message_positions[index][0]
             if self._follow_mode:
                 self._scroll_to_message(index)
+
+    def _find_word_in_message(self, msg_idx: int, word: str, start_pos: int) -> QTextCursor | None:
+        if not (0 <= msg_idx < len(self._message_positions)):
+            return None
+
+        msg_start, msg_end = self._message_positions[msg_idx]
+        if msg_end <= msg_start:
+            return None
+
+        from PyQt6.QtGui import QTextDocument
+        doc = self.public_view.document()
+        flags = (
+            QTextDocument.FindFlag.FindCaseSensitively
+            | QTextDocument.FindFlag.FindWholeWords
+        )
+
+        pos = max(msg_start, min(start_pos, msg_end - 1))
+        found = doc.find(word, pos, flags)
+        while not found.isNull():
+            s = found.selectionStart()
+            e = found.selectionEnd()
+            if s >= msg_end:
+                break
+            if s >= msg_start and e <= msg_end:
+                return found
+            pos = max(pos + 1, e)
+            if pos >= msg_end:
+                break
+            found = doc.find(word, pos, flags)
+
+        return None
 
     def highlight_word(self, msg_idx: int, char_offset: int, word_len: int) -> None:
         """Called on each SAPI5 word-boundary event — moves the orange cursor."""
@@ -383,41 +422,66 @@ class CenterDebatePanel(QWidget):
             self._word_search_msg = msg_idx
             if 0 <= msg_idx < len(self._message_positions):
                 self._word_search_pos = self._message_positions[msg_idx][0]
+                self._last_tts_char_offset = -1
             else:
                 return
 
-        # Get the actual word text from the cleaned version
+        if 0 <= msg_idx < len(self._message_positions):
+            msg_start, _ = self._message_positions[msg_idx]
+        else:
+            return
+
+        # SAPI offsets should be monotonic within one utterance; if not, reset safely.
+        if char_offset < self._last_tts_char_offset:
+            self._word_search_pos = msg_start
+        self._last_tts_char_offset = char_offset
+
+        # Get the active cleaned utterance (the exact text TTS is reading)
         if msg_idx >= len(self._cleaned_texts):
             return
         cleaned = self._cleaned_texts[msg_idx]
-        raw_word = cleaned[char_offset: char_offset + word_len].strip()
-        if not raw_word:
-            return
-        # ── Cap to maximum 2 words — never highlight a whole phrase/sentence ──
-        parts = raw_word.split()
-        word  = " ".join(parts[:2]) if len(parts) > 2 else raw_word
-        # Strip trailing punctuation so the find() succeeds
-        word = word.rstrip(".,;:!?\"'")
-        if not word:
+        if not cleaned:
             return
 
-        doc = self.public_view.document()
+        clean_start = max(0, min(char_offset, len(cleaned) - 1))
+        clean_end = max(clean_start + 1, min(char_offset + word_len, len(cleaned)))
+
+        # Trim spaces from both ends of the active span
+        while clean_start < clean_end and cleaned[clean_start].isspace():
+            clean_start += 1
+        while clean_end > clean_start and cleaned[clean_end - 1].isspace():
+            clean_end -= 1
+        if clean_end <= clean_start:
+            return
+
+        map_local = self._get_clean_to_doc_map(msg_idx)
+        if map_local is None or not map_local:
+            return
+
+        if clean_start >= len(map_local):
+            clean_start = len(map_local) - 1
+        if clean_end - 1 >= len(map_local):
+            clean_end = len(map_local)
+
+        local_start = map_local[clean_start]
+        local_end = map_local[clean_end - 1] + 1
+        if local_start < 0 or local_end <= local_start:
+            return
+
+        msg_start, msg_end = self._message_positions[msg_idx]
+        doc_start = msg_start + local_start
+        doc_end = msg_start + local_end
+        if doc_start < msg_start or doc_start >= msg_end:
+            return
+        doc_end = max(doc_start + 1, min(doc_end, msg_end))
 
         # Clear the previous word highlight first
         self._clear_word_cursor()
 
-        # Search forward in the document from last known position
-        from PyQt6.QtGui import QTextDocument
-        found = doc.find(word, self._word_search_pos,
-                         QTextDocument.FindFlag(0))  # case-insensitive, forward
-        if found.isNull():
-            # Fallback: retry from message start
-            if 0 <= msg_idx < len(self._message_positions):
-                found = doc.find(word, self._message_positions[msg_idx][0],
-                                 QTextDocument.FindFlag(0))
-
-        if found.isNull():
-            return
+        doc = self.public_view.document()
+        found = QTextCursor(doc)
+        found.setPosition(doc_start)
+        found.setPosition(doc_end, QTextCursor.MoveMode.KeepAnchor)
 
         # Advance search position for next word
         self._word_search_pos = found.selectionEnd()
@@ -432,8 +496,90 @@ class CenterDebatePanel(QWidget):
 
         # Scroll to keep the word visible — only when follow mode is on
         if self._follow_mode:
-            self.public_view.setTextCursor(found)
-            self.public_view.ensureCursorVisible()
+            self._stable_scroll_to_cursor(found)
+
+    def _get_clean_to_doc_map(self, msg_idx: int) -> list[int] | None:
+        if not (0 <= msg_idx < len(self._cleaned_texts)):
+            return None
+        cached = self._clean_to_doc_maps[msg_idx] if msg_idx < len(self._clean_to_doc_maps) else None
+        if cached is not None:
+            return cached
+
+        if not (0 <= msg_idx < len(self._message_positions)):
+            return None
+        msg_start, msg_end = self._message_positions[msg_idx]
+        if msg_end <= msg_start:
+            return None
+
+        cleaned = self._cleaned_texts[msg_idx]
+        if not cleaned:
+            return None
+
+        doc_text = self.public_view.document().toPlainText()
+        segment = doc_text[msg_start:msg_end]
+        if not segment:
+            return None
+
+        # Start alignment near the likely message body to avoid matching speaker/title noise.
+        start_hint = 0
+        for tok in re.findall(r"\w{4,}", cleaned)[:3]:
+            pos = segment.lower().find(tok.lower())
+            if pos >= 0:
+                start_hint = pos
+                break
+
+        mapping: list[int] = [-1] * len(cleaned)
+        seg_len = len(segment)
+        scan_pos = min(max(0, start_hint), max(0, seg_len - 1))
+
+        for clean_i, ch in enumerate(cleaned):
+            if scan_pos >= seg_len:
+                break
+
+            if ch.isspace():
+                while scan_pos < seg_len and segment[scan_pos].isspace():
+                    scan_pos += 1
+                mapping[clean_i] = min(scan_pos, seg_len - 1)
+                continue
+
+            target = ch.lower()
+            found = -1
+            hard_limit = min(seg_len, scan_pos + 220)
+            probe = scan_pos
+            while probe < hard_limit:
+                if segment[probe].lower() == target:
+                    found = probe
+                    break
+                probe += 1
+
+            if found < 0:
+                continue
+
+            mapping[clean_i] = found
+            scan_pos = found + 1
+
+        # Fill gaps to preserve monotonic mapping
+        last = -1
+        for i, pos in enumerate(mapping):
+            if pos >= 0:
+                last = pos
+            else:
+                mapping[i] = last
+
+        nxt = -1
+        for i in range(len(mapping) - 1, -1, -1):
+            pos = mapping[i]
+            if pos >= 0:
+                nxt = pos
+            else:
+                mapping[i] = nxt
+
+        if all(pos < 0 for pos in mapping):
+            return None
+
+        if msg_idx < len(self._clean_to_doc_maps):
+            self._clean_to_doc_maps[msg_idx] = mapping
+        return mapping
 
     def clear_highlight(self) -> None:
         self._clear_word_cursor()
@@ -455,6 +601,37 @@ class CenterDebatePanel(QWidget):
         """(Unused externally but kept for scroll-only use.)"""
         pass
 
+    # ---------------------------------------------------------------- stable scroll
+
+    def _stable_scroll_to_cursor(self, cursor: QTextCursor) -> None:
+        """Scroll only when needed, placing the cursor line at a stable 30%
+        position from the top of the viewport. Never bounces."""
+        view = self.public_view
+        vbar = view.verticalScrollBar()
+
+        # Temporarily set the cursor so cursorRect() reflects its position,
+        # but save/restore the scrollbar so setTextCursor doesn't jolt.
+        saved = vbar.value()
+        view.setTextCursor(cursor)
+        vbar.setValue(saved)
+
+        rect = view.cursorRect(cursor)
+        viewport_h = view.viewport().height()
+        cursor_y = rect.top()
+
+        # Comfortable band: 20%-80% of the viewport height
+        band_top = int(viewport_h * 0.20)
+        band_bot = int(viewport_h * 0.80)
+
+        if band_top <= cursor_y <= band_bot:
+            # Word is comfortably visible — don't scroll at all
+            return
+
+        # Scroll so the word sits at ~30% from the top
+        target_y = int(viewport_h * 0.30)
+        delta = cursor_y - target_y
+        new_val = max(0, min(vbar.maximum(), saved + delta))
+        vbar.setValue(new_val)
 
     def _scroll_to_message(self, index: int) -> None:
         if index >= len(self._message_positions):
@@ -463,5 +640,4 @@ class CenterDebatePanel(QWidget):
         doc = self.public_view.document()
         cursor = QTextCursor(doc)
         cursor.setPosition(min(start, doc.characterCount() - 1))
-        self.public_view.setTextCursor(cursor)
-        self.public_view.ensureCursorVisible()
+        self._stable_scroll_to_cursor(cursor)

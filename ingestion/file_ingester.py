@@ -21,12 +21,45 @@ from typing import Any
 _CHUNK_SIZE = 600       # characters per chunk
 _CHUNK_OVERLAP = 80    # overlap between chunks
 
+# Directories that should never be ingested (matched against any path component)
+_EXCLUDED_DIRS = frozenset({
+    "__pycache__", ".venv", "venv", ".git", "node_modules", ".pytest_cache",
+    ".mypy_cache", ".tox", ".eggs", "dist", "build", ".idea", ".vscode",
+    "env", ".env", ".story-reader", ".ai", ".morph", ".github",
+    ".ruff_cache", "__pypackages__", "site-packages", ".cargo",
+})
+
+# Binary / non-text extensions to skip even if they appear in a valid folder
+_EXCLUDED_EXTS = frozenset({
+    ".exe", ".dll", ".so", ".dylib", ".pyd", ".pyc", ".pyo",
+    ".whl", ".egg", ".tar", ".gz", ".bz2", ".zip", ".7z", ".rar",
+    ".ico", ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp",
+    ".mp3", ".mp4", ".wav", ".avi", ".mkv", ".mov", ".flac",
+    ".bin", ".dat", ".db", ".sqlite", ".sqlite3",
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    ".class", ".o", ".obj", ".lib", ".a",
+    ".lock", ".map",
+})
+
+
+def _is_excluded_path(p: Path) -> bool:
+    """Return True if any path component is in the excluded dirs set."""
+    for part in p.parts:
+        if part.lower() in _EXCLUDED_DIRS:
+            return True
+    return False
+
 
 def ingest_files(file_paths: list[Path]) -> list[dict]:
     """Read a list of files and return a flat list of tagged fact dicts."""
     all_facts: list[dict] = []
     for p in file_paths:
         if not p.exists() or not p.is_file():
+            continue
+        # Skip junk files
+        if p.suffix.lower() in _EXCLUDED_EXTS:
+            continue
+        if _is_excluded_path(p):
             continue
         try:
             chunks = _read_and_chunk(p)
