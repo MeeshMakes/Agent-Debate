@@ -523,32 +523,6 @@ class MainWindow(QMainWindow):
         stats_lay.addWidget(self._stats_subtopics_lbl)
         stats_lay.addStretch()
 
-        # Follow Text button — re-engages TTS word scroll after user breaks it by scrolling
-        self._follow_text_btn = QPushButton("Follow Text")
-        self._follow_text_btn.setObjectName("followTextBtn")
-        self._follow_text_btn.setCheckable(True)
-        self._follow_text_btn.setChecked(True)   # on by default
-        self._follow_text_btn.setFixedHeight(22)
-        self._follow_text_btn.setToolTip(
-            "When active, the view scrolls with TTS playback.\n"
-            "Scrolling up/down with the mouse wheel breaks it."
-        )
-        self._follow_text_btn.setStyleSheet(
-            "QPushButton#followTextBtn {"
-            "  background: #0d2137; color: #546e7a;"
-            "  border: 1px solid #1a3a55; border-radius: 3px;"
-            "  font-size: 8pt; font-weight: 600; padding: 0 8px;"
-            "}"
-            "QPushButton#followTextBtn:checked {"
-            "  background: #0d3349; color: #00e5ff;"
-            "  border: 1px solid #00e5ff;"
-            "}"
-            "QPushButton#followTextBtn:hover { background: #112640; }"
-        )
-        self._follow_text_btn.clicked.connect(self._on_follow_text_btn_clicked)
-        # When the panel breaks follow-mode (user scrolled), update button appearance
-        self.center_panel.follow_mode_changed.connect(self._on_follow_mode_changed)
-        stats_lay.addWidget(self._follow_text_btn)
 
         # Cloud usage counter — increments each time a cloud model speaks
         _cloud_sep = QFrame()
@@ -1477,17 +1451,6 @@ class MainWindow(QMainWindow):
         self._start_repo_watchdog()
         self._status_bar.showMessage(f"Continuing debate for {extra_turns} more turns...")
 
-    # ---------------------------------------------------------------- follow-text
-
-    def _on_follow_text_btn_clicked(self, checked: bool) -> None:
-        """User clicked the Follow Text toggle button."""
-        self.center_panel.set_follow_mode(checked)
-
-    def _on_follow_mode_changed(self, enabled: bool) -> None:
-        """Panel emitted follow_mode_changed (e.g. user scrolled away) — sync button."""
-        self._follow_text_btn.blockSignals(True)
-        self._follow_text_btn.setChecked(enabled)
-        self._follow_text_btn.blockSignals(False)
 
     def _on_arbiter_inject(self, text: str, snippets: list) -> None:
         """Called when user sends arbiter message + staged snippets while paused."""

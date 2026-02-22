@@ -1,786 +1,688 @@
-"""Centre debate stream \u2014 page-per-turn architecture.
+"""center_debate_panel.py — Live debate stream, one page per turn.
 
-Each agent response fills the entire panel as a full-screen "page".  The
-visible page is split horizontally:
+TTS Word-Highlight Design
+─────────────────────────
+Problem the old code had:
+  • engine.say(clean_text) — SAPI5 reads the *cleaned* string
+  • word_at fires (msg_idx, location, length) where location is a char
+    offset into that *cleaned* string
+  • The body QTextBrowser was rendering markdown → HTML, a completely
+    different string.  The old _get_clean_to_doc_map() tried to align
+    them but drifted and broke within seconds.
 
-    Left sidebar  (~20%)  \u2014  talking-point changes, quality scores,
-                              citations / sources, model name.
-    Right body    (~80%)  \u2014  scrollable QTextBrowser with the response text.
-                              This is the ONLY text TTS reads, making
-                              cursor-follow trivial.
+Fix:
+  • body.setPlainText(cleaned_text)   ← same string SAPI5 is reading
+  • char_offset == document position  ← 1:1, zero drift, guaranteed
+  • No mapping algorithm at all.
 
-Navigation between turns is via \u25c0/\u25b6 buttons or auto-advancing when
-a new message arrives (follow-mode).
+Architecture
+────────────
+CenterDebatePanel (QWidget)
+  └─ QStackedWidget
+       └─ TurnPageWidget (QFrame)  ← one per agent turn
+            ├─ left sidebar: talking point / quality / model / citations
+            └─ right body:   LockedTextBrowser (plain-text, frozen viewport)
+                              ▼ more bar (arrow indicator when overflowing)
 """
+
 from __future__ import annotations
 
 from html import escape
-import re
-from urllib.parse import quote
+from typing import Callable, Optional
 
-try:
-    import markdown as _md_lib
-    _MD_AVAILABLE = True
-except ImportError:
-    _MD_AVAILABLE = False
-
-
-# \u2500\u2500 Document stylesheet applied inside each page's QTextBrowser \u2500\u2500
-_DOC_STYLESHEET = (
-    "body { margin: 0; padding: 0; } "
-    "p { margin: 4px 0; line-height: 180%; } "
-    "code { font-family: 'Cascadia Code', Consolas, 'Courier New', monospace; "
-    "background-color: #0d1b2a; color: #80cbc4; font-size: 10pt; "
-    "padding: 1px 5px; border-radius: 3px; } "
-    "pre { background-color: #0a1520; color: #a8e6cf; "
-    "font-family: 'Cascadia Code', Consolas, 'Courier New', monospace; "
-    "font-size: 10pt; padding: 10px 14px; margin: 6px 0; "
-    "border-left: 3px solid #00bcd4; line-height: 150%; } "
-    "blockquote { color: #b0bec5; margin-left: 12px; padding-left: 12px; "
-    "border-left: 2px solid #37474f; font-style: italic; } "
-    "strong { color: #e8f0ff; } "
-    "em { color: #b8c9d9; font-style: italic; } "
-    "a { color: #64b5f6; text-decoration: none; } "
-    "li { color: #e8eef9; margin: 2px 0; line-height: 170%; } "
-    "ul, ol { margin: 4px 0 4px 16px; } "
-    "h1 { color: #a0cfff; font-size: 14pt; margin: 8px 0 4px 0; } "
-    "h2 { color: #a0cfff; font-size: 13pt; margin: 6px 0 4px 0; } "
-    "h3 { color: #90b8e0; font-size: 12pt; margin: 4px 0 2px 0; } "
-    "table { border-collapse: collapse; margin: 4px 0; } "
-    "td, th { padding: 4px 8px; border: 1px solid #2a3a55; } "
-    "th { background-color: #0f1e35; color: #80cbc4; font-weight: 700; } "
-)
-
-
-def _md_to_html(text: str) -> str:
-    if _MD_AVAILABLE:
-        try:
-            return _md_lib.markdown(
-                text,
-                extensions=["fenced_code", "tables"],
-                output_format="html",
-            )
-        except Exception:
-            pass
-    return escape(text)
-
-
-from PyQt6.QtCore import QUrl, pyqtSignal, Qt, QTimer
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QSizePolicy, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QScrollArea,
+    QSizePolicy,
+    QStackedWidget,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
 )
-from tts.speech_engine import TTSPlaybackWorker
+
+# ── TTS highlight colours ──────────────────────────────────────────────────
+_TTS_BG = QColor("#e65100")
+_TTS_FG = QColor("#ffffff")
+
+# ── Visual theme ───────────────────────────────────────────────────────────
+_AGENT_COLOR: dict[str, str] = {}   # populated at runtime via append_message
+_PANEL_BG = "#070d18"
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LockedTextBrowser
+#  Viewport is frozen during TTS.  The ONLY movement allowed is our own
+#  TTS-triggered page advance when the highlighted word has scrolled off-screen.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LockedTextBrowser(QTextBrowser):
+    """Plain-text QTextBrowser with a frozen viewport and TTS page-advance."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._lock_scroll   = True      # viewport frozen by default
+        self._paging        = False     # True only during our own page jump
+        self._last_cur: Optional[QTextCursor] = None
+        self._last_fmt: Optional[QTextCharFormat] = None
+        # called with (value, maximum) when the scrollbar position changes
+        self.on_scroll_changed: Optional[Callable[[int, int], None]] = None
+
+    # ── Suppress Qt-internal auto-scroll ──────────────────────────────────
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        if self._lock_scroll and not self._paging:
+            return
+        super().scrollContentsBy(dx, dy)
+        self._notify_scroll()
+
+    def ensureCursorVisible(self) -> None:
+        if self._lock_scroll:
+            return
+        super().ensureCursorVisible()
+
+    def _notify_scroll(self) -> None:
+        if self.on_scroll_changed:
+            vb = self.verticalScrollBar()
+            self.on_scroll_changed(vb.value(), vb.maximum())
+
+    # ── TTS-triggered page advance ─────────────────────────────────────────
+    def _try_page_down(self, doc_pos: int) -> None:
+        """Advance viewport by one page if doc_pos is below the visible area."""
+        cursor = QTextCursor(self.document())
+        cursor.setPosition(max(0, min(doc_pos, self.document().characterCount() - 1)))
+        rect = self.cursorRect(cursor)           # coords relative to viewport
+        vh   = self.viewport().height()
+        if rect.top() < vh:
+            return                               # still on screen — nothing to do
+        vb   = self.verticalScrollBar()
+        step = max(vh - 40, 60)                  # one page minus a small overlap
+        self._paging = True
+        vb.setValue(vb.value() + step)
+        self._paging = False
+        self._notify_scroll()
+
+    # ── Word highlight ─────────────────────────────────────────────────────
+    def highlight_word(self, char_offset: int, word_len: int) -> None:
+        """Highlight characters [char_offset, char_offset+word_len) in the doc.
+
+        Because body.setPlainText(cleaned_text) was used and the TTS engine
+        also reads cleaned_text, char_offset == document position.  No mapping.
+        """
+        if word_len <= 0:
+            return
+        doc     = self.document()
+        doc_len = doc.characterCount()
+        start   = max(0, char_offset)
+        end     = min(char_offset + word_len, doc_len - 1)
+        if end <= start:
+            return
+
+        # Page-advance before applying highlight so the word is visible
+        self._try_page_down(start)
+
+        self._clear_last_highlight()
+
+        cur = QTextCursor(doc)
+        cur.setPosition(start)
+        cur.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+
+        self._last_fmt = cur.charFormat()
+        self._last_cur = cur
+
+        fmt = QTextCharFormat()
+        fmt.setBackground(_TTS_BG)
+        fmt.setForeground(_TTS_FG)
+        cur.setCharFormat(fmt)
+
+    def clear_highlight(self) -> None:
+        self._clear_last_highlight()
+
+    def _clear_last_highlight(self) -> None:
+        if self._last_cur and not self._last_cur.isNull():
+            self._last_cur.setCharFormat(
+                self._last_fmt if self._last_fmt is not None else QTextCharFormat()
+            )
+        self._last_cur = None
+        self._last_fmt = None
 
 
-# \u2500\u2500 Per-agent theming \u2500\u2500
-AGENT_COLORS = {
-    "Astra": "#00e5ff",
-    "Nova": "#ff6e40",
-    "Arbiter": "#ffd740",
-    "Resolution": "#69f0ae",
-    "Repo Watchdog": "#b39ddb",
-}
-
-AGENT_ICONS = {
-    "Astra": "\u25c6",        # diamond
-    "Nova": "\u25cf",         # circle
-    "Arbiter": "\u25b2",      # triangle
-    "Resolution": "\u2726",   # star
-    "Repo Watchdog": "\u29d6",  # hourglass
-}
-
-AGENT_CARD_BG = {
-    "Astra": "#0a1525",
-    "Nova": "#150f0a",
-    "Arbiter": "#14120a",
-    "Resolution": "#0a1510",
-    "Repo Watchdog": "#100e18",
-}
-
-_TTS_HIGHLIGHT_BG = QColor("#e65100")
-_TTS_HIGHLIGHT_FG = QColor("#ffffff")
-
-
-# =====================================================================
-#  TurnPageWidget \u2014 one full-panel page per agent response
-# =====================================================================
+# ═══════════════════════════════════════════════════════════════════════════
+#  TurnPageWidget
+#  One full-panel page per agent turn.
+# ═══════════════════════════════════════════════════════════════════════════
 
 class TurnPageWidget(QFrame):
-    """Full-page widget for a single debate turn.
+    """Displays a single agent turn: sidebar metadata + locked body text."""
 
-    Layout:  [ left sidebar ~20% | right body ~80% ]
-    """
-
-    anchor_clicked = pyqtSignal(QUrl)
+    source_clicked = pyqtSignal(str, str)   # (doc_id, text)
 
     def __init__(
         self,
-        speaker: str,
-        text: str,
-        msg_num: int,
-        *,
-        citations: list[dict] | None = None,
-        evidence_score: float | None = None,
-        talking_point_html: str = "",
-        quality: dict | None = None,
-        model_name: str | None = None,
-        reframe: str | None = None,
-        parent: QWidget | None = None,
+        msg_idx:       int,
+        speaker:       str,
+        turn_num:      int,
+        total_turns:   int,
+        talking_point: str,
+        body_text:     str,
+        quality:       dict,
+        citations:     list,
+        model_name:    str,
+        agent_color:   str,
+        bg_color:      str,
+        parent:        QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        color = AGENT_COLORS.get(speaker, "#e0e0e0")
-        icon = AGENT_ICONS.get(speaker, "\u25cf")
-        card_bg = AGENT_CARD_BG.get(speaker, "#0c1422")
+        self.msg_idx   = msg_idx
+        self._color    = agent_color
+        self._bg       = bg_color
 
-        self.speaker = speaker
-        self.raw_text = text
-        self.cleaned_text = TTSPlaybackWorker.clean_text(text)
+        # ── Import TTSPlaybackWorker.clean_text at runtime to avoid circular ──
+        try:
+            from tts.speech_engine import TTSPlaybackWorker
+            self._cleaned_text: str = TTSPlaybackWorker.clean_text(body_text)
+        except Exception:
+            self._cleaned_text = body_text
 
-        # -- Frame styling -- the whole page
-        self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setStyleSheet(
-            f"TurnPageWidget {{ background: {card_bg}; }}"
+        self._setup_ui(speaker, turn_num, total_turns, talking_point,
+                       quality, citations, model_name)
+
+    # ── Build layout ───────────────────────────────────────────────────────
+    def _setup_ui(
+        self,
+        speaker:       str,
+        turn_num:      int,
+        total_turns:   int,
+        talking_point: str,
+        quality:       dict,
+        citations:     list,
+        model_name:    str,
+    ) -> None:
+        color = self._color
+        bg    = self._bg
+
+        self.setStyleSheet(f"QFrame {{ background: {bg}; border: none; }}")
+
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        # ── Header bar ──────────────────────────────────────────────────────
+        header = QWidget()
+        header.setFixedHeight(46)
+        header.setStyleSheet(
+            f"background: #050b16; border-bottom: 2px solid {color}44;"
         )
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Expanding)
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(18, 0, 18, 0)
 
-        page_layout = QHBoxLayout(self)
-        page_layout.setContentsMargins(0, 0, 0, 0)
-        page_layout.setSpacing(0)
-
-        # =============================================================
-        #  LEFT SIDEBAR  (~20%)
-        # =============================================================
-        sidebar_scroll = QScrollArea()
-        sidebar_scroll.setWidgetResizable(True)
-        sidebar_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        icon     = "\u25c6" if "astra" in speaker.lower() else "\u25cf"
+        spk_lbl  = QLabel(
+            f"<span style='color:{color}; font-size:13pt; font-weight:900; "
+            f"letter-spacing:2px;'>{icon} {escape(speaker).upper()}</span>"
         )
-        sidebar_scroll.setStyleSheet(
-            f"QScrollArea {{ background: {card_bg}; border: none; "
-            f"border-right: 2px solid {color}30; }}"
+        spk_lbl.setTextFormat(Qt.TextFormat.RichText)
+        hl.addWidget(spk_lbl)
+        hl.addStretch()
+
+        if total_turns > 0:
+            turn_lbl = QLabel(
+                f"<span style='color:#37506a; font-size:8.5pt;'>TURN &nbsp;</span>"
+                f"<span style='color:{color}; font-size:15pt; "
+                f"font-weight:900;'>{turn_num}</span>"
+                f"<span style='color:#2a3a55; font-size:9pt;'> / {total_turns}</span>"
+            )
+            turn_lbl.setTextFormat(Qt.TextFormat.RichText)
+            hl.addWidget(turn_lbl)
+
+        root_layout.addWidget(header)
+
+        # ── Sidebar + body ──────────────────────────────────────────────────
+        content_row = QWidget()
+        content_row.setStyleSheet(f"background: {bg};")
+        cl = QHBoxLayout(content_row)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        root_layout.addWidget(content_row, stretch=1)
+
+        # LEFT SIDEBAR
+        sb_scroll = QScrollArea()
+        sb_scroll.setWidgetResizable(True)
+        sb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sb_scroll.setFixedWidth(210)
+        sb_scroll.setStyleSheet(
+            f"QScrollArea {{ background: {bg}; border: none; "
+            f"border-right: 2px solid {color}18; }}"
             "QScrollBar:vertical { width: 4px; background: transparent; }"
-            f"QScrollBar::handle:vertical {{ background: {color}40; "
-            "border-radius: 2px; }"
+            f"QScrollBar::handle:vertical {{ background: {color}30; "
+            "border-radius: 2px; }}"
         )
-        sidebar_scroll.setSizePolicy(QSizePolicy.Policy.Preferred,
-                                     QSizePolicy.Policy.Expanding)
-        sidebar_scroll.setMinimumWidth(170)
-        sidebar_scroll.setMaximumWidth(300)
 
         sidebar = QWidget()
-        sidebar.setStyleSheet(f"background: {card_bg};")
-        side_lay = QVBoxLayout(sidebar)
-        side_lay.setContentsMargins(14, 16, 14, 16)
-        side_lay.setSpacing(10)
+        sidebar.setStyleSheet(f"background: {bg};")
+        sl = QVBoxLayout(sidebar)
+        sl.setContentsMargins(14, 16, 14, 16)
+        sl.setSpacing(12)
 
-        # -- Agent identity block --
-        agent_hdr = QLabel()
-        agent_hdr.setTextFormat(Qt.TextFormat.RichText)
-        agent_hdr.setWordWrap(True)
-        agent_hdr.setStyleSheet("background: transparent;")
-        agent_hdr.setText(
-            f"<div style='margin-bottom:4px;'>"
-            f"<span style='color:{color}; font-size:18pt; font-weight:900; "
-            f"letter-spacing:1.5px; "
-            f"font-family:Segoe UI,system-ui,sans-serif;'>"
-            f"{icon} {escape(speaker).upper()}</span></div>"
-            f"<span style='color:#3a5065; font-size:9pt; "
-            f"font-weight:600;'>Response #{msg_num}</span>"
+        self._populate_sidebar(sl, color, talking_point, quality,
+                               citations, model_name)
+        sl.addStretch()
+        sb_scroll.setWidget(sidebar)
+        cl.addWidget(sb_scroll)
+
+        # RIGHT BODY
+        body_wrap = QWidget()
+        body_wrap.setStyleSheet(f"background: {bg};")
+        bwl = QVBoxLayout(body_wrap)
+        bwl.setContentsMargins(16, 14, 16, 10)
+        bwl.setSpacing(6)
+
+        # Outlined document frame
+        doc_frame = QFrame()
+        doc_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        doc_frame.setStyleSheet(
+            f"QFrame {{ background: #040c18; "
+            f"border: 1px solid {color}40; border-radius: 6px; }}"
         )
-        side_lay.addWidget(agent_hdr)
+        dfl = QVBoxLayout(doc_frame)
+        dfl.setContentsMargins(0, 0, 0, 0)
+        dfl.setSpacing(0)
 
-        # -- Separator --
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"background: {color}25; border: none;")
-        side_lay.addWidget(sep)
+        # LockedTextBrowser setup
+        self._body = LockedTextBrowser(doc_frame)
+        self._body.setReadOnly(True)
+        self._body.setOpenLinks(False)
+        self._body.setStyleSheet(
+            "QTextBrowser {"
+            "  background: transparent;"
+            "  border: none;"
+            "  color: #c8d8e8;"
+            f" font-size: 10.5pt;"
+            "  font-family: 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;"
+            "  padding: 14px 18px 14px 18px;"
+            "  line-height: 175%;"
+            "}"
+            "QScrollBar:vertical { width: 7px; background: transparent; }"
+            f"QScrollBar::handle:vertical {{ background: {color}35; "
+            "border-radius: 3px; }}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            "height:0; }"
+        )
+        self._body.setPlainText(self._cleaned_text)
+        self._body.on_scroll_changed = self._on_scroll_changed
+        dfl.addWidget(self._body, stretch=1)
 
-        # -- Talking-point badge --
-        if talking_point_html:
-            tp_section = QLabel()
-            tp_section.setTextFormat(Qt.TextFormat.RichText)
-            tp_section.setWordWrap(True)
-            tp_section.setStyleSheet("background: transparent; padding: 0;")
-            tp_section.setText(
-                f"<div style='margin-bottom:2px;'>"
-                f"<span style='color:#546e7a; font-size:7.5pt; "
-                f"font-weight:700; letter-spacing:1.5px;'>TALKING POINT</span></div>"
-                f"{talking_point_html}"
+        # ▼ more indicator bar (hidden when no overflow)
+        self._arrow_bar = self._make_arrow_bar(color)
+        dfl.addWidget(self._arrow_bar)
+        self._arrow_bar.setVisible(False)
+
+        bwl.addWidget(doc_frame, stretch=1)
+
+        # Page counter label (e.g. "pg 1 / 2")
+        self._page_lbl = QLabel("")
+        self._page_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._page_lbl.setStyleSheet(
+            f"color: {color}50; font-size: 7.5pt; "
+            "background: transparent; border: none;"
+        )
+        bwl.addWidget(self._page_lbl)
+        self._update_page_label()
+
+        cl.addWidget(body_wrap, stretch=1)
+
+        # Connect scroll for arrow visibility
+        vb = self._body.verticalScrollBar()
+        vb.rangeChanged.connect(lambda *_: self._on_scroll_changed(vb.value(), vb.maximum()))
+        vb.valueChanged.connect(lambda v: self._on_scroll_changed(v, vb.maximum()))
+
+    # ── Sidebar population ─────────────────────────────────────────────────
+    def _populate_sidebar(
+        self,
+        sl:            QVBoxLayout,
+        color:         str,
+        talking_point: str,
+        quality:       dict,
+        citations:     list,
+        model_name:    str,
+    ) -> None:
+
+        def _sec(txt: str) -> QLabel:
+            lb = QLabel(
+                f"<span style='color:#2e4a62; font-size:7pt; "
+                f"font-weight:800; letter-spacing:2.5px;'>{txt}</span>"
             )
-            side_lay.addWidget(tp_section)
+            lb.setTextFormat(Qt.TextFormat.RichText)
+            lb.setStyleSheet("background: transparent;")
+            return lb
 
-        # -- Quality scores --
+        def _hsep() -> QFrame:
+            f = QFrame()
+            f.setFrameShape(QFrame.Shape.HLine)
+            f.setFixedHeight(1)
+            f.setStyleSheet(f"background: {color}10; border: none;")
+            return f
+
+        bg = self._bg
+
+        if talking_point:
+            sl.addWidget(_sec("TALKING POINT"))
+            tp = QLabel(
+                f"<span style='color:#5d8a84; font-size:8.5pt; "
+                f"font-style:italic; line-height:160%;'>"
+                f"{escape(talking_point)}</span>"
+            )
+            tp.setTextFormat(Qt.TextFormat.RichText)
+            tp.setWordWrap(True)
+            tp.setStyleSheet(f"background: {bg};")
+            sl.addWidget(tp)
+            sl.addWidget(_hsep())
+
         if quality:
-            q_composite = round(
-                (quality.get("relevance", 0.0) + quality.get("novelty", 0.0)
-                 + quality.get("evidence", 0.0)) / 3, 2,
-            )
-            if q_composite >= 0.65:
-                badge_color, dot = "#69f0ae", "\u25b2"
-            elif q_composite >= 0.45:
-                badge_color, dot = "#ffd740", "\u25cf"
-            else:
-                badge_color, dot = "#ef5350", "\u25bc"
-
-            q_lbl = QLabel()
-            q_lbl.setTextFormat(Qt.TextFormat.RichText)
-            q_lbl.setWordWrap(True)
-            q_lbl.setStyleSheet("background: transparent;")
-            q_lbl.setText(
-                f"<div style='margin-bottom:2px;'>"
-                f"<span style='color:#546e7a; font-size:7.5pt; "
-                f"font-weight:700; letter-spacing:1.5px;'>QUALITY</span></div>"
-                f"<span style='color:{badge_color}; font-size:14pt; "
-                f"font-weight:800;'>{dot} {q_composite:.2f}</span>"
-                f"<div style='margin-top:4px; color:#607d8b; font-size:8pt;'>"
-                f"Relevance: {quality.get('relevance', 0):.2f}<br>"
-                f"Novelty: {quality.get('novelty', 0):.2f}<br>"
-                f"Evidence: {quality.get('evidence', 0):.2f}"
+            rv = quality.get("relevance", quality.get("r", 0))
+            nv = quality.get("novelty",   quality.get("n", 0))
+            ev = quality.get("evidence",  quality.get("e", 0))
+            qc = round((rv + nv + ev) / 3, 2)
+            bc  = "#69f0ae" if qc >= 0.65 else ("#ffd740" if qc >= 0.45 else "#ef5350")
+            dot = "\u25b2"  if qc >= 0.65 else ("\u25cf"  if qc >= 0.45 else "\u25bc")
+            sl.addWidget(_sec("QUALITY"))
+            ql = QLabel(
+                f"<span style='color:{bc}; font-size:18pt; "
+                f"font-weight:900;'>{dot} {qc:.2f}</span>"
+                f"<div style='margin-top:5px; color:#3d5a6e; font-size:7.5pt; "
+                f"line-height:175%;'>"
+                f"Relevance &nbsp;<b style='color:#57788e'>{rv:.2f}</b><br>"
+                f"Novelty &nbsp;&nbsp;&nbsp;<b style='color:#57788e'>{nv:.2f}</b><br>"
+                f"Evidence &nbsp;<b style='color:#57788e'>{ev:.2f}</b>"
                 f"</div>"
             )
-            side_lay.addWidget(q_lbl)
+            ql.setTextFormat(Qt.TextFormat.RichText)
+            ql.setWordWrap(True)
+            ql.setStyleSheet(f"background: {bg};")
+            sl.addWidget(ql)
+            sl.addWidget(_hsep())
 
-        # -- Evidence score --
-        if evidence_score is not None and evidence_score > 0:
-            ev_lbl = QLabel()
-            ev_lbl.setTextFormat(Qt.TextFormat.RichText)
-            ev_lbl.setWordWrap(True)
-            ev_lbl.setStyleSheet("background: transparent;")
-            ev_lbl.setText(
-                f"<div style='margin-bottom:2px;'>"
-                f"<span style='color:#546e7a; font-size:7.5pt; "
-                f"font-weight:700; letter-spacing:1.5px;'>EVIDENCE</span></div>"
-                f"<span style='color:#80cbc4; font-size:11pt; "
-                f"font-weight:700;'>{evidence_score:.3f}</span>"
-            )
-            side_lay.addWidget(ev_lbl)
-
-        # -- Model name --
         if model_name:
-            mod_lbl = QLabel()
-            mod_lbl.setTextFormat(Qt.TextFormat.RichText)
-            mod_lbl.setWordWrap(True)
-            mod_lbl.setStyleSheet("background: transparent;")
-            mod_lbl.setText(
-                f"<div style='margin-bottom:2px;'>"
-                f"<span style='color:#546e7a; font-size:7.5pt; "
-                f"font-weight:700; letter-spacing:1.5px;'>MODEL</span></div>"
-                f"<span style='color:#455a64; font-size:8.5pt; "
+            sl.addWidget(_sec("MODEL"))
+            ml = QLabel(
+                f"<span style='color:#354f63; font-size:8pt; "
                 f"font-style:italic;'>{escape(model_name)}</span>"
             )
-            side_lay.addWidget(mod_lbl)
+            ml.setTextFormat(Qt.TextFormat.RichText)
+            ml.setWordWrap(True)
+            ml.setStyleSheet(f"background: {bg};")
+            sl.addWidget(ml)
+            sl.addWidget(_hsep())
 
-        # -- Reframe card --
-        if reframe:
-            agent_low = speaker.lower()
-            if agent_low == "astra":
-                rf_border, rf_label = "#80cbc4", "#80cbc4"
-            elif agent_low == "nova":
-                rf_border, rf_label = "#ffab91", "#ffab91"
-            else:
-                rf_border, rf_label = "#b39ddb", "#b39ddb"
-
-            rf_lbl = QLabel()
-            rf_lbl.setTextFormat(Qt.TextFormat.RichText)
-            rf_lbl.setWordWrap(True)
-            rf_lbl.setStyleSheet(
-                f"background: #10101e; border-left: 3px solid {rf_border}; "
-                f"padding: 8px 10px; margin: 0;"
-            )
-            rf_lbl.setText(
-                f"<span style='color:{rf_label}; font-size:7.5pt; "
-                f"font-weight:700; letter-spacing:1px;'>"
-                f"\u2726 REFRAME</span><br>"
-                f"<span style='color:#c5cae9; font-size:9pt; "
-                f"font-style:italic; font-family:Georgia,serif; "
-                f"line-height:1.7;'>{_md_to_html(reframe)}</span>"
-            )
-            side_lay.addWidget(rf_lbl)
-
-        # -- Citations / Sources --
         if citations:
-            src_lbl = QLabel()
-            src_lbl.setTextFormat(Qt.TextFormat.RichText)
-            src_lbl.setWordWrap(True)
-            src_lbl.setOpenExternalLinks(False)
-            src_lbl.setStyleSheet("background: transparent;")
-            src_lines = [
-                "<div style='margin-bottom:2px;'>"
-                "<span style='color:#546e7a; font-size:7.5pt; "
-                "font-weight:700; letter-spacing:1.5px;'>SOURCES</span></div>"
-            ]
+            sl.addWidget(_sec("SOURCES"))
             for i, cit in enumerate(citations, 1):
-                sp = str(cit.get("source_path", "")).replace("\\", "/")
-                href = f"source:///{quote(sp, safe='/:._-')}"
-                title = escape(str(cit.get("title", "Unknown")))
-                disp = escape(str(cit.get("source", "")))
-                sc = float(cit.get("score", 0.0))
-                src_lines.append(
-                    f"<div style='margin:2px 0;'>"
-                    f"<span style='color:#546e7a; font-size:8pt;'>"
-                    f"[{i}] {title}</span><br>"
-                    f"<span style='color:#455a64; font-size:7.5pt;'>"
-                    f"Score: {sc:.3f}</span> "
-                    f"<a href='{href}' style='color:#64b5f6; font-size:7.5pt;'>"
-                    f"{disp}</a>"
+                title  = cit.get("title",  cit.get("t", ""))
+                source = cit.get("source", cit.get("s", ""))
+                score  = cit.get("score",  cit.get("sc", 0.0))
+                cl2 = QLabel(
+                    f"<div style='margin:3px 0;'>"
+                    f"<span style='color:#3d5a6e; font-size:7.5pt; "
+                    f"font-weight:600; line-height:155%;'>"
+                    f"[{i}] {escape(str(title))}</span><br>"
+                    f"<span style='color:#2e4455; font-size:7pt;'>"
+                    f"{escape(str(source))}  "
+                    f"<b style='color:#4a6a7e'>{float(score):.2f}</b></span>"
                     f"</div>"
                 )
-            src_lbl.setText("".join(src_lines))
-            side_lay.addWidget(src_lbl)
+                cl2.setTextFormat(Qt.TextFormat.RichText)
+                cl2.setWordWrap(True)
+                cl2.setStyleSheet(f"background: {bg};")
+                sl.addWidget(cl2)
 
-        # Push everything to the top
-        side_lay.addStretch()
-        sidebar_scroll.setWidget(sidebar)
-
-        page_layout.addWidget(sidebar_scroll)
-
-        # =============================================================
-        #  RIGHT BODY  (~80%) -- the only readable / TTS text
-        # =============================================================
-        body_container = QWidget()
-        body_container.setStyleSheet(f"background: {card_bg};")
-        body_lay = QVBoxLayout(body_container)
-        body_lay.setContentsMargins(20, 14, 20, 14)
-        body_lay.setSpacing(0)
-
-        self.body = QTextBrowser()
-        self.body.setObjectName("turnBody")
-        self.body.setOpenExternalLinks(False)
-        self.body.document().setDefaultStyleSheet(_DOC_STYLESHEET)
-        self.body.setFrameShape(QFrame.Shape.NoFrame)
-        self.body.setStyleSheet(
-            "QTextBrowser#turnBody { "
-            "  background: transparent; "
-            "  border: none; "
-            "  padding: 0; "
-            "  color: #e0e8f8; "
-            "  font-size: 11pt; "
-            "  font-family: 'Segoe UI', system-ui, sans-serif; "
-            "}"
+    # ── Arrow bar ──────────────────────────────────────────────────────────
+    @staticmethod
+    def _make_arrow_bar(color: str) -> QLabel:
+        bar = QLabel(
+            "<div style='text-align:center; padding:4px 0 2px 0;'>"
+            f"<span style='color:{color}; font-size:11pt;'>&#9660;</span>"
+            f"<span style='color:{color}70; font-size:7.5pt; "
+            "margin-left:6px;'>more</span>"
+            "</div>"
         )
-        self.body.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        bar.setTextFormat(Qt.TextFormat.RichText)
+        bar.setFixedHeight(26)
+        bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        bar.setStyleSheet(
+            "border: none; border-top: 1px solid "
+            + color + "20; background: transparent;"
         )
-        self.body.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self.body.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
+        return bar
 
-        body_html = _md_to_html(text)
-        self.body.setHtml(
-            f"<div style='color:#e0e8f8; line-height:1.9; "
-            f"letter-spacing:0.15px;'>{body_html}</div>"
-        )
-        self.body.anchorClicked.connect(self.anchor_clicked.emit)
-        body_lay.addWidget(self.body)
+    # ── Scroll callbacks ───────────────────────────────────────────────────
+    def _on_scroll_changed(self, value: int, maximum: int) -> None:
+        has_more = maximum > 0 and value < maximum
+        self._arrow_bar.setVisible(has_more)
+        self._update_page_label()
 
-        page_layout.addWidget(body_container)
+    def _update_page_label(self) -> None:
+        vb     = self._body.verticalScrollBar()
+        maxv   = vb.maximum()
+        vh     = self._body.viewport().height()
+        if maxv <= 0 or vh <= 0:
+            self._page_lbl.setText("")
+            return
+        page_h   = max(vh, 1)
+        total_pg = max(1, -(-int(vb.maximum() + vh) // page_h))   # ceil div
+        cur_pg   = min(total_pg, (vb.value() // page_h) + 1)
+        self._page_lbl.setText(f"pg {cur_pg} / {total_pg}")
 
-        # Set sidebar vs body proportions via stretch
-        page_layout.setStretch(0, 1)   # sidebar  (~20%)
-        page_layout.setStretch(1, 4)   # body     (~80%)
-
-        # -- TTS state --
-        self._word_cursor: QTextCursor | None = None
-        self._word_cursor_fmt: QTextCharFormat | None = None
-        self._clean_to_doc_map: list[int] | None = None
-
-    # -- TTS word highlight -----------------------------------------------
-
+    # ── Public highlight API ───────────────────────────────────────────────
     def highlight_word(self, char_offset: int, word_len: int) -> None:
-        """Highlight a single word in this page's body from TTS char offset."""
-        if word_len <= 0:
-            return
-        cleaned = self.cleaned_text
-        if not cleaned:
-            return
-
-        clean_start = max(0, min(char_offset, len(cleaned) - 1))
-        clean_end = max(
-            clean_start + 1, min(char_offset + word_len, len(cleaned))
-        )
-
-        # Trim whitespace at edges
-        while clean_start < clean_end and cleaned[clean_start].isspace():
-            clean_start += 1
-        while clean_end > clean_start and cleaned[clean_end - 1].isspace():
-            clean_end -= 1
-        if clean_end <= clean_start:
-            return
-
-        mapping = self._get_clean_to_doc_map()
-        if mapping is None:
-            return
-
-        if clean_start >= len(mapping):
-            clean_start = len(mapping) - 1
-        if clean_end - 1 >= len(mapping):
-            clean_end = len(mapping)
-
-        doc_start = mapping[clean_start]
-        doc_end = mapping[clean_end - 1] + 1
-        if doc_start < 0 or doc_end <= doc_start:
-            return
-
-        # Clamp to document length
-        doc_len = self.body.document().characterCount()
-        doc_start = min(doc_start, doc_len - 1)
-        doc_end = min(doc_end, doc_len)
-        if doc_end <= doc_start:
-            return
-
-        self.clear_word_highlight()
-
-        cursor = QTextCursor(self.body.document())
-        cursor.setPosition(doc_start)
-        cursor.setPosition(doc_end, QTextCursor.MoveMode.KeepAnchor)
-
-        self._word_cursor_fmt = cursor.charFormat()
-        fmt = QTextCharFormat()
-        fmt.setBackground(_TTS_HIGHLIGHT_BG)
-        fmt.setForeground(_TTS_HIGHLIGHT_FG)
-        cursor.setCharFormat(fmt)
-        self._word_cursor = cursor
-
-        # Scroll the body browser so the highlighted word stays visible
-        visible_cursor = QTextCursor(self.body.document())
-        visible_cursor.setPosition(doc_start)
-        self.body.setTextCursor(visible_cursor)
-        self.body.ensureCursorVisible()
-
-    def clear_word_highlight(self) -> None:
-        if self._word_cursor is not None and not self._word_cursor.isNull():
-            if self._word_cursor_fmt is not None:
-                self._word_cursor.setCharFormat(self._word_cursor_fmt)
-            else:
-                self._word_cursor.setCharFormat(QTextCharFormat())
-        self._word_cursor = None
-        self._word_cursor_fmt = None
-
-    def _get_clean_to_doc_map(self) -> list[int] | None:
-        if self._clean_to_doc_map is not None:
-            return self._clean_to_doc_map
-
-        cleaned = self.cleaned_text
-        if not cleaned:
-            return None
-
-        doc_text = self.body.document().toPlainText()
-        if not doc_text:
-            return None
-
-        mapping: list[int] = [-1] * len(cleaned)
-        seg_len = len(doc_text)
-        scan_pos = 0
-
-        for ci, ch in enumerate(cleaned):
-            if scan_pos >= seg_len:
-                break
-            if ch.isspace():
-                while scan_pos < seg_len and doc_text[scan_pos].isspace():
-                    scan_pos += 1
-                mapping[ci] = min(scan_pos, seg_len - 1)
-                continue
-            target = ch.lower()
-            probe = scan_pos
-            limit = min(seg_len, scan_pos + 220)
-            while probe < limit:
-                if doc_text[probe].lower() == target:
-                    mapping[ci] = probe
-                    scan_pos = probe + 1
-                    break
-                probe += 1
-
-        # Fill gaps -- forward then backward
-        last = -1
-        for i, v in enumerate(mapping):
-            if v >= 0:
-                last = v
-            else:
-                mapping[i] = last
-        nxt = -1
-        for i in range(len(mapping) - 1, -1, -1):
-            if mapping[i] >= 0:
-                nxt = mapping[i]
-            else:
-                mapping[i] = nxt
-
-        if all(v < 0 for v in mapping):
-            return None
-
-        self._clean_to_doc_map = mapping
-        return mapping
-
-
-# =====================================================================
-#  CenterDebatePanel -- page-based turn container
-# =====================================================================
-
-class CenterDebatePanel(QWidget):
-    follow_mode_changed = pyqtSignal(bool)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setObjectName("centerDebatePanel")
-
-        # -- Header row --
-        self._header_widget = QWidget()
-        self._header_widget.setObjectName("debateHeader")
-        header_row = QHBoxLayout(self._header_widget)
-        header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.setSpacing(8)
-
-        self._header = QLabel("\u25b8 LIVE DEBATE STREAM")
-        self._header.setStyleSheet(
-            "font-size: 14pt; font-weight: 900; color: #c0e0ff; "
-            "padding: 8px 0; letter-spacing: 3px;"
-        )
-        header_row.addWidget(self._header)
-        header_row.addStretch()
-
-        self._turn_indicator = QLabel("")
-        self._turn_indicator.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        self._turn_indicator.setStyleSheet(
-            "font-size: 10pt; color: #78909c; padding: 4px 8px;"
-        )
-        header_row.addWidget(self._turn_indicator)
-
-        # -- Stacked widget -- holds one TurnPageWidget per turn
-        self._stack = QStackedWidget()
-        self._stack.setObjectName("publicView")
-        self._stack.setStyleSheet(
-            "QStackedWidget#publicView { "
-            "  background-color: #060c18; "
-            "  border: 2px solid #0e2240; "
-            "  border-radius: 12px; "
-            "}"
-        )
-
-        # -- Navigation bar --
-        self._nav_widget = QWidget()
-        nav_row = QHBoxLayout(self._nav_widget)
-        nav_row.setContentsMargins(4, 4, 4, 4)
-        nav_row.setSpacing(8)
-
-        _nav_btn_style = (
-            "QPushButton { background: #0e1a2f; color: #80cbc4; "
-            "border: 1px solid #1a3a55; border-radius: 6px; "
-            "padding: 4px 14px; font-size: 10pt; font-weight: 700; }"
-            "QPushButton:hover { background: #162a45; color: #fff; }"
-            "QPushButton:disabled { color: #2a3a50; border-color: #12203a; }"
-        )
-
-        self._prev_btn = QPushButton("\u25c0  Prev")
-        self._prev_btn.setStyleSheet(_nav_btn_style)
-        self._prev_btn.clicked.connect(self._go_prev)
-        nav_row.addWidget(self._prev_btn)
-
-        self._page_label = QLabel("0 / 0")
-        self._page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._page_label.setStyleSheet(
-            "color: #607d8b; font-size: 9.5pt; font-weight: 600; "
-            "letter-spacing: 1px;"
-        )
-        self._page_label.setTextFormat(Qt.TextFormat.RichText)
-        nav_row.addWidget(self._page_label, stretch=1)
-
-        self._next_btn = QPushButton("Next  \u25b6")
-        self._next_btn.setStyleSheet(_nav_btn_style)
-        self._next_btn.clicked.connect(self._go_next)
-        nav_row.addWidget(self._next_btn)
-
-        # -- Main layout --
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
-        layout.addWidget(self._header_widget)
-        layout.addWidget(self._stack, stretch=1)
-        layout.addWidget(self._nav_widget)
-
-        # Backward-compat: some code may reference public_view
-        self.public_view = self._stack
-
-        # -- State --
-        self._follow_mode: bool = True
-        self._pages: list[TurnPageWidget] = []
-        self._messages: list[tuple[str, str]] = []
-        self._cleaned_texts: list[str] = []
-        self._last_talking_point: str = ""
-        self._msg_count: int = 0
-        self._highlighted_idx: int = -1
-        self._source_click_handler = None
-
-        self._update_nav()
-
-    # -- public API -------------------------------------------------------
-
-    def set_source_click_handler(self, handler) -> None:
-        self._source_click_handler = handler
-
-    @property
-    def is_follow_mode(self) -> bool:
-        return self._follow_mode
-
-    def set_follow_mode(self, enabled: bool) -> None:
-        if self._follow_mode != enabled:
-            self._follow_mode = enabled
-            self.follow_mode_changed.emit(enabled)
-
-    def get_messages(self) -> list[tuple[str, str]]:
-        return list(self._messages)
-
-    def clear_messages(self) -> None:
-        self._messages.clear()
-        self._cleaned_texts.clear()
-        while self._stack.count():
-            w = self._stack.widget(0)
-            self._stack.removeWidget(w)
-            w.deleteLater()
-        self._pages.clear()
-        self._highlighted_idx = -1
-        self._msg_count = 0
-        self._last_talking_point = ""
-        self._turn_indicator.setText("")
-        self._update_nav()
-
-    def update_turn_indicator(
-        self, speaker: str, turn: int, total_turns: int = 0
-    ) -> None:
-        color = AGENT_COLORS.get(speaker, "#e0e0e0")
-        turn_text = (
-            f"Turn {turn}/{total_turns}" if total_turns > 0 else f"Turn {turn}"
-        )
-        self._turn_indicator.setText(
-            f"<span style='color:{color}; font-weight:700;'>{speaker}</span>"
-            f"<span style='color:#546e7a;'>  \u00b7  </span>"
-            f"<span style='color:#90a4ae; font-weight:600;'>{turn_text}</span>"
-        )
-
-    def append_message(
-        self,
-        speaker: str,
-        text: str,
-        citations: list[dict] | None = None,
-        evidence_score: float | None = None,
-        talking_point: str | None = None,
-        quality: dict | None = None,
-        model_name: str | None = None,
-        reframe: str | None = None,
-    ) -> None:
-        self._messages.append((speaker, text))
-        self._cleaned_texts.append(TTSPlaybackWorker.clean_text(text))
-        self._msg_count += 1
-
-        # Talking-point HTML (suppress repeats)
-        tp_html = ""
-        if talking_point and talking_point != self._last_talking_point:
-            self._last_talking_point = talking_point
-            tp_html = (
-                f"<span style='color:#6a9e98; font-size:9pt; "
-                f"font-style:italic;'>"
-                f"\u25b8 {escape(talking_point)}</span>"
-            )
-
-        page = TurnPageWidget(
-            speaker,
-            text,
-            self._msg_count,
-            citations=citations,
-            evidence_score=evidence_score,
-            talking_point_html=tp_html,
-            quality=quality,
-            model_name=model_name,
-            reframe=reframe,
-        )
-        if self._source_click_handler:
-            page.anchor_clicked.connect(self._on_page_anchor)
-
-        self._stack.addWidget(page)
-        self._pages.append(page)
-
-        # In follow mode, auto-advance to the newest page
-        if self._follow_mode:
-            self._stack.setCurrentIndex(len(self._pages) - 1)
-
-        self._update_nav()
-
-    # -- TTS highlight ----------------------------------------------------
-
-    def highlight_message(self, index: int) -> None:
-        """TTS started a new message -- flip to that page."""
-        if 0 <= self._highlighted_idx < len(self._pages):
-            self._pages[self._highlighted_idx].clear_word_highlight()
-        self._highlighted_idx = index
-        if 0 <= index < len(self._pages):
-            self._stack.setCurrentIndex(index)
-            self._update_nav()
-
-    def highlight_word(
-        self, msg_idx: int, char_offset: int, word_len: int
-    ) -> None:
-        """Move the orange word highlight inside the active page's body."""
-        if not (0 <= msg_idx < len(self._pages)):
-            return
-        # Clear previous page's highlight if message changed
-        if msg_idx != self._highlighted_idx:
-            if 0 <= self._highlighted_idx < len(self._pages):
-                self._pages[self._highlighted_idx].clear_word_highlight()
-            self._highlighted_idx = msg_idx
-            self._stack.setCurrentIndex(msg_idx)
-            self._update_nav()
-
-        page = self._pages[msg_idx]
-        page.highlight_word(char_offset, word_len)
+        self._body.highlight_word(char_offset, word_len)
 
     def clear_highlight(self) -> None:
-        if 0 <= self._highlighted_idx < len(self._pages):
-            self._pages[self._highlighted_idx].clear_word_highlight()
-        self._highlighted_idx = -1
+        self._body.clear_highlight()
 
-    # -- navigation -------------------------------------------------------
 
-    def _go_prev(self) -> None:
-        idx = self._stack.currentIndex()
-        if idx > 0:
-            self._stack.setCurrentIndex(idx - 1)
-            self._update_nav()
+# ═══════════════════════════════════════════════════════════════════════════
+#  CenterDebatePanel — public-facing widget used by main_window.py
+# ═══════════════════════════════════════════════════════════════════════════
 
-    def _go_next(self) -> None:
-        idx = self._stack.currentIndex()
-        if idx < self._stack.count() - 1:
-            self._stack.setCurrentIndex(idx + 1)
-            self._update_nav()
+_AGENT_BG_COLORS = [
+    "#07101e",   # default blue-dark
+    "#110905",   # warm dark (second agent)
+    "#070f10",   # teal dark
+    "#12070f",   # purple dark
+]
 
-    def _update_nav(self) -> None:
-        total = self._stack.count()
-        cur = self._stack.currentIndex() + 1 if total > 0 else 0
-        self._page_label.setText(f"{cur} / {total}")
-        self._prev_btn.setEnabled(cur > 1)
-        self._next_btn.setEnabled(cur < total)
+_AGENT_ACCENT_COLORS = [
+    "#00e5ff",
+    "#ff6e40",
+    "#69f0ae",
+    "#ea80fc",
+]
 
-        # Show speaker color indicator in the nav row
-        if total > 0 and 0 <= self._stack.currentIndex() < len(self._pages):
-            page = self._pages[self._stack.currentIndex()]
-            color = AGENT_COLORS.get(page.speaker, "#e0e0e0")
-            self._page_label.setText(
-                f"<span style='color:{color}; font-weight:700;'>"
-                f"{escape(page.speaker)}</span>"
-                f"<span style='color:#546e7a;'>  "
-                f"{cur} / {total}</span>"
+
+class CenterDebatePanel(QWidget):
+    """Page-per-turn live debate stream.
+
+    Public API (unchanged from previous version):
+        append_message(...)      — add a turn page
+        highlight_message(idx)   — flip to a turn page
+        highlight_word(idx, offset, length) — TTS word highlight
+        clear_highlight()
+        clear_messages()
+        get_messages()
+        set_follow_mode(bool)    — no-op; always follows
+        update_turn_indicator(current, total)
+        set_source_click_handler(callback)
+        follow_mode_changed      — signal (kept for backward compat)
+        public_view              — alias for self
+    """
+
+    follow_mode_changed = pyqtSignal(bool)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.public_view = self
+
+        self._pages:       list[TurnPageWidget] = []
+        self._agent_map:   dict[str, int]       = {}   # name → color index
+        self._total_turns: int                  = 0
+        self._source_cb:   Optional[Callable]   = None
+
+        self._setup_ui()
+
+    # ── Build chrome ───────────────────────────────────────────────────────
+    def _setup_ui(self) -> None:
+        self.setStyleSheet(f"background: {_PANEL_BG}; border: none;")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Turn indicator strip
+        self._turn_bar = QWidget()
+        self._turn_bar.setFixedHeight(24)
+        self._turn_bar.setStyleSheet(
+            "background: #030810; border-bottom: 1px solid #0d1e30;"
+        )
+        til = QHBoxLayout(self._turn_bar)
+        til.setContentsMargins(12, 0, 12, 0)
+        self._turn_lbl = QLabel("")
+        self._turn_lbl.setStyleSheet(
+            "color: #1e3a52; font-size: 7.5pt; font-weight: 700; "
+            "letter-spacing: 1.5px; background: transparent;"
+        )
+        til.addStretch()
+        til.addWidget(self._turn_lbl)
+        outer.addWidget(self._turn_bar)
+
+        # Stacked pages
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet(f"background: {_PANEL_BG}; border: none;")
+        outer.addWidget(self._stack, stretch=1)
+
+        # Empty placeholder
+        placeholder = QWidget()
+        placeholder.setStyleSheet(f"background: {_PANEL_BG};")
+        pl_lbl = QLabel(
+            "<span style='color:#1a2d40; font-size:14pt; "
+            "font-weight:300; letter-spacing:3px;'>DEBATE STREAM</span>"
+        )
+        pl_lbl.setTextFormat(Qt.TextFormat.RichText)
+        pl_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pll = QVBoxLayout(placeholder)
+        pll.addStretch()
+        pll.addWidget(pl_lbl)
+        pll.addStretch()
+        self._stack.addWidget(placeholder)
+
+    # ── Colour assignment ──────────────────────────────────────────────────
+    def _color_for_agent(self, name: str) -> tuple[str, str]:
+        """Return (accent_color, bg_color) for an agent name."""
+        if name not in self._agent_map:
+            idx = len(self._agent_map) % len(_AGENT_ACCENT_COLORS)
+            self._agent_map[name] = idx
+        idx = self._agent_map[name]
+        return _AGENT_ACCENT_COLORS[idx], _AGENT_BG_COLORS[idx]
+
+    # ── Public API ─────────────────────────────────────────────────────────
+    def append_message(
+        self,
+        text:          str,
+        agent_name:    str,
+        *,
+        talking_point: str  = "",
+        quality:       dict | None = None,
+        citations:     list | None = None,
+        model_name:    str  = "",
+        turn_num:      int  = 0,
+    ) -> int:
+        """Create a new turn page and return its msg_idx."""
+        msg_idx = len(self._pages)
+        accent, bg = self._color_for_agent(agent_name)
+        page = TurnPageWidget(
+            msg_idx       = msg_idx,
+            speaker       = agent_name,
+            turn_num      = turn_num or (msg_idx + 1),
+            total_turns   = self._total_turns,
+            talking_point = talking_point,
+            body_text     = text,
+            quality       = quality or {},
+            citations     = citations or [],
+            model_name    = model_name,
+            agent_color   = accent,
+            bg_color      = bg,
+            parent        = None,
+        )
+        if self._source_cb:
+            page.source_clicked.connect(self._source_cb)
+
+        self._pages.append(page)
+        self._stack.addWidget(page)
+        self._stack.setCurrentWidget(page)   # auto-advance to newest
+        return msg_idx
+
+    def highlight_message(self, msg_idx: int) -> None:
+        """Flip the stack to the page for msg_idx (called by now_speaking)."""
+        if 0 <= msg_idx < len(self._pages):
+            self._stack.setCurrentWidget(self._pages[msg_idx])
+
+    def highlight_word(self, msg_idx: int, char_offset: int, word_len: int) -> None:
+        """Highlight a word during TTS playback (called by word_at signal).
+
+        char_offset is a byte offset into clean_text() — same string used by
+        setPlainText(), so it maps directly to document position.
+        """
+        if 0 <= msg_idx < len(self._pages):
+            self._pages[msg_idx].highlight_word(char_offset, word_len)
+
+    def clear_highlight(self) -> None:
+        """Clear any active TTS word highlight."""
+        page = self._current_page()
+        if page:
+            page.clear_highlight()
+
+    def clear_messages(self) -> None:
+        """Remove all turn pages."""
+        for page in self._pages:
+            self._stack.removeWidget(page)
+            page.deleteLater()
+        self._pages.clear()
+        self._agent_map.clear()
+        self._stack.setCurrentIndex(0)   # back to placeholder
+
+    def get_messages(self) -> list[dict]:
+        """Return a list of minimal message dicts (for compatibility)."""
+        return [
+            {"idx": p.msg_idx, "text": p._cleaned_text}
+            for p in self._pages
+        ]
+
+    def set_follow_mode(self, enabled: bool) -> None:
+        """No-op — the panel always follows TTS (kept for API compatibility)."""
+        # Emit so any connected slots still receive the signal
+        self.follow_mode_changed.emit(True)
+
+    def update_turn_indicator(self, current: int, total: int) -> None:
+        """Update the turn counter shown in the top bar."""
+        self._total_turns = total
+        if total > 0:
+            self._turn_lbl.setText(
+                f"TURN  {current} / {total}"
             )
+        else:
+            self._turn_lbl.setText("")
 
-    # -- internal ---------------------------------------------------------
+    def set_source_click_handler(self, callback: Callable) -> None:
+        """Register a callback(doc_id, text) for citation clicks."""
+        self._source_cb = callback
+        for page in self._pages:
+            try:
+                page.source_clicked.disconnect()
+            except Exception:
+                pass
+            page.source_clicked.connect(callback)
 
-    def _on_page_anchor(self, url: QUrl) -> None:
-        if url.scheme() == "source":
-            source_path = url.path().lstrip("/")
-            if self._source_click_handler:
-                self._source_click_handler(source_path)
+    # ── Internal helpers ───────────────────────────────────────────────────
+    def _current_page(self) -> Optional[TurnPageWidget]:
+        w = self._stack.currentWidget()
+        return w if isinstance(w, TurnPageWidget) else None
