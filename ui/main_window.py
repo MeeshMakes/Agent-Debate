@@ -658,18 +658,48 @@ class MainWindow(QMainWindow):
         model_sep.setFrameShape(QFrame.Shape.VLine)
         model_sep.setStyleSheet("color: #2a3a55;")
 
-        # Turns / Endless
+        # Turns / Endless  — spinbox with arrow buttons (arrow-keys + direct typing)
         turns_label = QLabel("Turns:")
         turns_label.setStyleSheet("color: #90a4ae;")
-        self._turns_display = QLabel("10")
-        self._turns_display.setStyleSheet("color: #e0e0e0; min-width: 24px;")
-        self._turns_slider = _NoWheelSlider(Qt.Orientation.Horizontal)
-        self._turns_slider.setObjectName("turnsSlider")
-        self._turns_slider.setRange(4, 100)
-        self._turns_slider.setValue(10)
-        self._turns_slider.setMaximumWidth(100)
-        self._turns_slider.valueChanged.connect(
-            lambda v: self._turns_display.setText(str(v))
+
+        self._turns_dec_btn = QPushButton("◀")
+        self._turns_dec_btn.setFixedSize(24, 26)
+        self._turns_dec_btn.setObjectName("turnsDecBtn")
+        self._turns_dec_btn.setStyleSheet(
+            "QPushButton { background: #0d1828; color: #78909c; border: 1px solid #2a3a55;"
+            " border-radius: 5px; font-size: 9pt; }"
+            "QPushButton:hover { background: #1a2840; color: #00e5ff; }"
+            "QPushButton:pressed { background: #001a2a; }"
+        )
+
+        self._turns_spin = QSpinBox()
+        self._turns_spin.setObjectName("turnsSpin")
+        self._turns_spin.setRange(4, 100)
+        self._turns_spin.setValue(10)
+        self._turns_spin.setFixedWidth(58)
+        self._turns_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self._turns_spin.setStyleSheet(
+            "QSpinBox { background: #0a1520; color: #e0e0e0; border: 1px solid #2a3a55;"
+            " border-radius: 6px; padding: 3px 5px; font-size: 11pt; font-weight: 700;"
+            " text-align: center; }"
+            "QSpinBox:focus { border-color: #00acc1; }"
+        )
+
+        self._turns_inc_btn = QPushButton("▶")
+        self._turns_inc_btn.setFixedSize(24, 26)
+        self._turns_inc_btn.setObjectName("turnsIncBtn")
+        self._turns_inc_btn.setStyleSheet(
+            "QPushButton { background: #0d1828; color: #78909c; border: 1px solid #2a3a55;"
+            " border-radius: 5px; font-size: 9pt; }"
+            "QPushButton:hover { background: #1a2840; color: #00e5ff; }"
+            "QPushButton:pressed { background: #001a2a; }"
+        )
+
+        self._turns_dec_btn.clicked.connect(
+            lambda: self._turns_spin.setValue(max(4, self._turns_spin.value() - 1))
+        )
+        self._turns_inc_btn.clicked.connect(
+            lambda: self._turns_spin.setValue(min(100, self._turns_spin.value() + 1))
         )
 
         self._endless_check = QCheckBox("Endless")
@@ -776,8 +806,9 @@ class MainWindow(QMainWindow):
         row.addWidget(self._ollama_info_btn)
         row.addWidget(model_sep)
         row.addWidget(turns_label)
-        row.addWidget(self._turns_slider)
-        row.addWidget(self._turns_display)
+        row.addWidget(self._turns_dec_btn)
+        row.addWidget(self._turns_spin)
+        row.addWidget(self._turns_inc_btn)
         row.addWidget(self._endless_check)
         row.addWidget(self.start_button)
         row.addWidget(self.stop_button)
@@ -1243,11 +1274,9 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
 
     def _on_endless_toggled(self, checked: bool) -> None:
-        self._turns_slider.setEnabled(not checked)
-        if checked:
-            self._turns_display.setText("∞")
-        else:
-            self._turns_display.setText(str(self._turns_slider.value()))
+        self._turns_spin.setEnabled(not checked)
+        self._turns_dec_btn.setEnabled(not checked)
+        self._turns_inc_btn.setEnabled(not checked)
 
     def _on_speed_changed(self, value: int) -> None:
         self._speed_display.setText(str(value))
@@ -1270,7 +1299,10 @@ class MainWindow(QMainWindow):
                     "\n".join(f"  • {tp}" for tp in first.talking_points)
 
         endless = self._endless_check.isChecked()
-        turns = self._turns_slider.value() if not endless else 10
+        turns = self._turns_spin.value() if not endless else 10
+
+        # Reset start button label for fresh run
+        self.start_button.setText("\u25b6  Start")
 
         # Reset UI
         self.left_panel.private_view.clear()
@@ -1447,7 +1479,7 @@ class MainWindow(QMainWindow):
     def _continue_debate(self) -> None:
         if not hasattr(self, 'orchestrator') or self.orchestrator is None:
             return
-        extra_turns = self._turns_slider.value()
+        extra_turns = self._turns_spin.value()
         self._continue_btn.setVisible(False)
         self._set_debate_transport_state("running")
 
@@ -1505,6 +1537,8 @@ class MainWindow(QMainWindow):
         # Reset debate controls
         self._set_debate_transport_state("stopped")
         self.arbiter_panel.set_paused_state(False)
+        # Signal that a session has ended — Start becomes "New Session"
+        self.start_button.setText("\U0001f504  New Session")
 
         # Trigger debate summary + verdict worker
         self.scoring_panel.set_summary_generating()
@@ -1887,7 +1921,7 @@ class MainWindow(QMainWindow):
             turn    = event.payload.get("turn", 0)
             quality = event.payload.get("quality")
             # Update the turn/speaker indicator in the header
-            total_turns = 0 if self._endless_check.isChecked() else self._turns_slider.value()
+            total_turns = 0 if self._endless_check.isChecked() else self._turns_spin.value()
             self.center_panel.update_turn_indicator(agent, turn, total_turns)
             # Resolve the model name from the live provider at the moment of delivery
             model_name = ""
