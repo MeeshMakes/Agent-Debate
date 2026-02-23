@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QSlider,
     QSpinBox,
@@ -560,7 +561,30 @@ class MainWindow(QMainWindow):
         stats_lay.addWidget(_cloud_sep)
         stats_lay.addWidget(self._cloud_calls_lbl)
 
-        _cl.addWidget(self._stats_bar)
+        # Grounding pass progress indicator (hidden until a grounding pass runs)
+        _grnd_sep = QFrame()
+        _grnd_sep.setFrameShape(QFrame.Shape.VLine)
+        _grnd_sep.setStyleSheet("color: #1a3a55;")
+        self._grounding_lbl = QLabel("")
+        self._grounding_lbl.setStyleSheet("color: #7e57c2; font-size: 9pt; font-weight: 600;")
+        self._grounding_lbl.setToolTip("Grounding pass: cross-referencing agent claims against the repo dataset")
+        self._grounding_bar = QProgressBar()
+        self._grounding_bar.setObjectName("groundingBar")
+        self._grounding_bar.setFixedWidth(120)
+        self._grounding_bar.setFixedHeight(10)
+        self._grounding_bar.setRange(0, 100)
+        self._grounding_bar.setValue(0)
+        self._grounding_bar.setTextVisible(False)
+        self._grounding_bar.setStyleSheet(
+            "QProgressBar { background: #0d1520; border: 1px solid #2a3a55;"
+            " border-radius: 4px; }"
+            "QProgressBar::chunk { background: #7e57c2; border-radius: 3px; }"
+        )
+        self._grounding_lbl.setVisible(False)
+        self._grounding_bar.setVisible(False)
+        stats_lay.addWidget(_grnd_sep)
+        stats_lay.addWidget(self._grounding_lbl)
+        stats_lay.addWidget(self._grounding_bar)
 
         self.setCentralWidget(_central)
 
@@ -1301,6 +1325,9 @@ class MainWindow(QMainWindow):
         endless = self._endless_check.isChecked()
         turns = self._turns_spin.value() if not endless else 10
 
+        # Reset grounding indicator
+        self._grounding_lbl.setVisible(False)
+        self._grounding_bar.setVisible(False)
         # Reset start button label for fresh run
         self.start_button.setText("\u25b6  Start")
 
@@ -2002,6 +2029,30 @@ class MainWindow(QMainWindow):
             right_facts = len(self.orchestrator.right_agent.semantic_memory.facts)
             self.left_panel.update_memory_count(left_facts)
             self.right_panel.update_memory_count(right_facts)
+
+        elif event.event_type == "grounding_progress":
+            agent = event.payload.get("agent", "")
+            done  = int(event.payload.get("done", 0))
+            total = int(event.payload.get("total", 1))
+            pct   = int(done / max(total, 1) * 100)
+            self._grounding_lbl.setText(f"\U0001f9e0 Grounding {agent} ({done}/{total})")
+            self._grounding_bar.setValue(pct)
+            self._grounding_lbl.setVisible(True)
+            self._grounding_bar.setVisible(True)
+
+        elif event.event_type == "grounding_done":
+            matched = event.payload.get("matched", 0)
+            checked = event.payload.get("claims_checked", 0)
+            agent   = event.payload.get("agent", "")
+            self._grounding_bar.setValue(100)
+            self._grounding_lbl.setText(
+                f"\u2714 Grounded {agent}: {matched}/{checked} claims matched"
+            )
+            # Hide after 4 s
+            QTimer.singleShot(4000, lambda: (
+                self._grounding_lbl.setVisible(False),
+                self._grounding_bar.setVisible(False),
+            ))
 
         elif event.event_type == "arbiter":
             self.arbiter_panel.set_message(

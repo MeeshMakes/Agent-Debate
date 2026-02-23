@@ -257,6 +257,28 @@ class _RepoSchemaWorker(QThread):
             self.failed.emit(f"Repo prep failed: {exc}")
 
 
+class _RebuildDatasetWorker(QThread):
+    """Rebuilds the repo watchdog semantic dataset from scratch."""
+    finished = pyqtSignal(int)   # fact_count
+    failed   = pyqtSignal(str)
+
+    def __init__(self, *, repo_path: str, session_root, parent=None) -> None:
+        super().__init__(parent)
+        self._repo_path   = repo_path
+        self._session_root = session_root
+
+    def run(self) -> None:
+        try:
+            from core.repo_watchdog import RepoWatchdog
+            wd = RepoWatchdog(self._session_root)
+            wd.build_snapshot(self._repo_path)
+            ds = wd.load_semantic_dataset(self._repo_path)
+            fact_count = len((ds or {}).get("facts", []))
+            self.finished.emit(fact_count)
+        except Exception as exc:
+            self.failed.emit(f"Rebuild failed: {exc}")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Helpers
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1414,6 +1436,22 @@ class TopicPickerDialog(QDialog):
         prep_row.addWidget(self._repo_allow_cloud_cb)
         prep_row.addWidget(self._repo_model_combo)
         prep_row.addWidget(self._repo_prep_status)
+
+        self._repo_rebuild_btn = QPushButton("\U0001f504  Rebuild Dataset")
+        self._repo_rebuild_btn.setVisible(False)
+        self._repo_rebuild_btn.setToolTip(
+            "Re-scan the linked repository and rebuild the semantic dataset from scratch.\n"
+            "Run this after large changes to keep the agent context up to date."
+        )
+        self._repo_rebuild_btn.setStyleSheet(
+            "QPushButton { background: #0d2030; color: #80cbc4; border-radius: 6px;"
+            " padding: 5px 12px; font-size: 11px; border: 1px solid #2a6a7a; }"
+            "QPushButton:hover { background: #1a3a50; color: #fff; }"
+            "QPushButton:disabled { color: #546e7a; border-color: #2a3a55; }"
+        )
+        self._repo_rebuild_btn.clicked.connect(self._on_rebuild_dataset_clicked)
+        prep_row.addWidget(self._repo_rebuild_btn)
+
         prep_row.addStretch()
         mode_lay.addLayout(prep_row)
 
@@ -1931,6 +1969,7 @@ class TopicPickerDialog(QDialog):
         self._repo_allow_cloud_cb.setVisible(is_repo_mode)
         self._repo_model_combo.setVisible(is_repo_mode)
         self._repo_prep_status.setVisible(is_repo_mode)
+        self._repo_rebuild_btn.setVisible(is_repo_mode)
         if is_repo_mode:
             self._load_repo_prep_models(fetch=True)
 
@@ -2102,6 +2141,40 @@ class TopicPickerDialog(QDialog):
 
     def _on_repo_prep_failed(self, error: str) -> None:
         self._repo_prep_btn.setEnabled(True)
+        self._repo_prep_status.setText(f"✗ {error[:100]}")
+
+    def _on_rebuild_dataset_clicked(self) -> None:
+        if hasattr(self, "_rebuild_worker") and self._rebuild_worker is not None:
+            if self._rebuild_worker.isRunning():
+                return
+        repo_path = self._repo_path_edit.text().strip()
+        if not repo_path:
+            QMessageBox.warning(self, "Rebuild Dataset", "Link a repository folder first.")
+            return
+        from pathlib import Path
+        if not Path(repo_path).is_dir():
+            QMessageBox.warning(self, "Rebuild Dataset", f"Folder not found:\n{repo_path}")
+            return
+        self._repo_rebuild_btn.setEnabled(False)
+        self._repo_prep_status.setText("🔄 Rebuilding dataset…")
+        self._repo_prep_status.setVisible(True)
+        from core.session_manager import get_session_manager
+        session_root = get_session_manager().root
+        self._rebuild_worker = _RebuildDatasetWorker(
+            repo_path=repo_path,
+            session_root=session_root,
+            parent=self,
+        )
+        self._rebuild_worker.finished.connect(self._on_rebuild_done)
+        self._rebuild_worker.failed.connect(self._on_rebuild_failed)
+        self._rebuild_worker.start()
+
+    def _on_rebuild_done(self, fact_count: int) -> None:
+        self._repo_rebuild_btn.setEnabled(True)
+        self._repo_prep_status.setText(f"✓ Dataset rebuilt — {fact_count} chunks")
+
+    def _on_rebuild_failed(self, error: str) -> None:
+        self._repo_rebuild_btn.setEnabled(True)
         self._repo_prep_status.setText(f"✗ {error[:100]}")
 
     # ── AI Rewrite ───────────────────────────────────────────────────────────

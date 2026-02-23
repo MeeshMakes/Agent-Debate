@@ -24,6 +24,7 @@ from memory.private_memory import PrivateMemory
 from memory.resolution_store import ResolutionStore, get_resolution_store
 from memory.shared_memory import SharedMemory
 from ingestion.dataset_context import DatasetContextProvider
+from agents.grounding_agent import GroundingAgent
 
 
 @dataclass
@@ -80,6 +81,9 @@ class DebateOrchestrator:
         self._agent_recent_msgs: dict[str, list[str]] = {}  # name → last 3 messages
         self._dataset_provider = DatasetContextProvider()
         self._focus_tracker = FocusBalanceTracker(window_size=6)
+        self._grounding_agent = GroundingAgent()
+        # Stores the context block to inject into each agent's next THINK phase
+        self._grounding_context: dict[str, str] = {}
 
     def subscribe(self, listener: Callable[[DebateEvent], None]) -> None:
         self._listeners.append(listener)
@@ -377,6 +381,13 @@ class DebateOrchestrator:
                         max_chars=4000,
                     )
 
+                # Inject grounding cross-reference from this agent's previous turn.
+                # If their last response proposed things already in the codebase,
+                # they are told so here before they think again.
+                prior_grounding = self._grounding_context.pop(current_speaker.name, "")
+                if prior_grounding:
+                    ds_context = prior_grounding + ("\n\n" + ds_context if ds_context else "")
+
                 focus_guidance = self._focus_tracker.build_guidance(
                     talking_point=self._active_talking_point_label,
                 )
@@ -500,6 +511,33 @@ class DebateOrchestrator:
                     self._active_talking_point_label = (
                         self._living_topic.seed if self._living_topic else topic
                     )
+
+                # -- GROUNDING PASS — cross-reference claims against repo dataset --
+                # Runs after SPEAK so the full response is available.
+                # Each speculative/assumptive/suggestive sentence is
+                # semantically searched against the ingested codebase.
+                # Findings are stored for injection into the agent's *next* THINK phase.
+                if self._dataset_provider.loaded:
+                    def _grounding_cb(done: int, total: int) -> None:
+                        self._emit("grounding_progress", {
+                            "agent": current_speaker.name,
+                            "turn": turn_index,
+                            "done": done,
+                            "total": total,
+                        })
+
+                    _report = self._grounding_agent.run(
+                        response_text=message,
+                        dataset_provider=self._dataset_provider,
+                        agent_name=current_speaker.name,
+                        turn_index=turn_index,
+                        progress_cb=_grounding_cb,
+                    )
+                    if _report.claims_checked > 0:
+                        ctx_block = _report.to_context_block()
+                        if ctx_block:
+                            self._grounding_context[current_speaker.name] = ctx_block
+                        self._emit("grounding_done", _report.to_event_payload())
 
                 # -- REFRAME phase (creative second pass) --
                 reframe_text = await current_speaker.reframe(message)
