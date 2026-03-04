@@ -73,6 +73,13 @@ class _NoWheelComboBox(QComboBox):
 # "-cloud" in their tag (e.g. "qwen3-coder:480b-cloud", "kimi-k2.5:cloud",
 # "deepseek-v3.1:671b-cloud").  All other models run locally.
 
+_KNOWN_CLOUD_MODELS = {
+    "qwen3-coder:480b-cloud",
+    "qwen3-coder:30b-cloud",
+    "deepseek-v3.1:671b-cloud",
+    "kimi-k2.5:cloud",
+}
+
 
 def _is_cloud_model(name: str) -> bool:
     """Return True if the model name/tag indicates an Ollama cloud model.
