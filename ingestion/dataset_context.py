@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -26,6 +27,9 @@ class DatasetContextProvider:
         self._loaded = False
         # Track which chunks each agent has already seen to rotate knowledge
         self._seen_indices: dict[str, set[int]] = {}
+        self._file_to_indices: dict[str, list[int]] = {}
+        self._file_tags: dict[str, set[str]] = {}
+        self._file_keyword_counts: dict[str, Counter[str]] = {}
 
     @property
     def loaded(self) -> bool:
@@ -54,6 +58,7 @@ class DatasetContextProvider:
                 self._facts = data.get("facts", [])
                 meta = data.get("_meta", {})
                 self._dataset_name = meta.get("name", "")
+            self._rebuild_file_index()
             self._loaded = bool(self._facts)
             return self._loaded
         except Exception:
@@ -63,6 +68,7 @@ class DatasetContextProvider:
         """Load facts directly (e.g. from an IngestionWorker)."""
         self._facts = facts
         self._dataset_name = name
+        self._rebuild_file_index()
         self._loaded = bool(facts)
 
     def get_context(
@@ -158,12 +164,14 @@ class DatasetContextProvider:
         # Build the formatted block
         lines: list[str] = []
         total_chars = 0
+        selected_paths: set[str] = set()
         for idx, _score in selected:
             fact = self._facts[idx]
             text = fact.get("text", "").strip()
             source = fact.get("source_file", "unknown")
             source_path = fact.get("source_path", source)
             chunk_i = fact.get("chunk_index", 0)
+            selected_paths.add(str(source_path).strip())
 
             line = f"[{source_path}#{chunk_i}] {text}"
             if total_chars + len(line) > max_chars:
@@ -178,8 +186,33 @@ class DatasetContextProvider:
         if not lines:
             return ""
 
+        ranked_files = self._rank_files_for_query(
+            scored=scored,
+            query_keywords=query_keywords,
+            explicit_targets=explicit_targets,
+            max_files=18,
+        )
+        file_map_lines = [
+            f"  • {item['path']}  (score={item['score']:.2f}, chunks={item['chunks']}, tags={','.join(item['tags'][:4]) or 'none'})"
+            for item in ranked_files[:12]
+        ]
+        next_probe_lines = [
+            f"  • {item['path']}"
+            for item in ranked_files
+            if item["path"] not in selected_paths
+        ][:8]
+
         header = f"INGESTED CODEBASE KNOWLEDGE ({len(lines)} chunks from {self._dataset_name or 'uploaded files'})"
-        return f"{header}:\n" + "\n".join(lines)
+        out = [f"{header}:"]
+        if file_map_lines:
+            out.append("FILE MAP (relevance-ranked for iterative investigation):")
+            out.extend(file_map_lines)
+        if next_probe_lines:
+            out.append("NEXT FILES TO PROBE:")
+            out.extend(next_probe_lines)
+        out.append("EVIDENCE CHUNKS:")
+        out.extend(lines)
+        return "\n".join(out)
 
     def _collect_forced_target_matches(
         self,
@@ -240,6 +273,118 @@ class DatasetContextProvider:
         if len(sources) > 15:
             summary += f" (+{len(sources) - 15} more)"
         return summary
+
+    def summarize_file_map(self, max_files: int = 30) -> list[dict]:
+        """Return a compact repository file map summary from loaded facts."""
+        if not self._facts:
+            return []
+        ranked = self._rank_files_for_query(scored=[], query_keywords=set(), explicit_targets=[], max_files=max_files)
+        return ranked[:max_files]
+
+    def search_files(self, query: str, max_results: int = 20) -> list[dict]:
+        """Search files using path + keyword relevance against the loaded dataset index."""
+        if not self._facts:
+            return []
+        keywords = _extract_query_keywords(query)
+        targets = _extract_query_file_targets(query)
+        return self._rank_files_for_query(scored=[], query_keywords=keywords, explicit_targets=targets, max_files=max_results)
+
+    def build_research_summary(self, query: str = "", max_files: int = 20) -> str:
+        """Build a layered summary (folders + files) for ongoing repo investigations."""
+        files = self.search_files(query, max_results=max_files) if query.strip() else self.summarize_file_map(max_files=max_files)
+        if not files:
+            return ""
+
+        folder_counts: dict[str, int] = defaultdict(int)
+        for item in files:
+            path = str(item.get("path", "")).strip()
+            top = path.split("/", 1)[0] if "/" in path else "<root>"
+            folder_counts[top] += 1
+
+        folder_lines = [f"  • {folder}: {count} file(s)" for folder, count in sorted(folder_counts.items(), key=lambda kv: kv[1], reverse=True)[:8]]
+        file_lines = [
+            f"  • {item.get('path', '')} (score={float(item.get('score', 0.0)):.2f}, tags={','.join(item.get('tags', [])[:4]) or 'none'})"
+            for item in files[:max_files]
+        ]
+        return (
+            "REPOSITORY RESEARCH SUMMARY\n"
+            "Top folders in current investigation scope:\n"
+            + ("\n".join(folder_lines) if folder_lines else "  • (none)")
+            + "\n\n"
+            "Priority files/modules:\n"
+            + ("\n".join(file_lines) if file_lines else "  • (none)")
+        )
+
+    def _rebuild_file_index(self) -> None:
+        self._file_to_indices = defaultdict(list)
+        self._file_tags = defaultdict(set)
+        self._file_keyword_counts = defaultdict(Counter)
+
+        for idx, fact in enumerate(self._facts):
+            source_file = str(fact.get("source_file", "") or "").strip()
+            source_path = str(fact.get("source_path", source_file) or source_file).strip()
+            if not source_path:
+                continue
+            self._file_to_indices[source_path].append(idx)
+
+            tags = fact.get("tags", [])
+            if isinstance(tags, list):
+                for tag in tags:
+                    t = str(tag).strip()
+                    if t:
+                        self._file_tags[source_path].add(t)
+
+            kws = fact.get("keywords", [])
+            if isinstance(kws, list):
+                for kw in kws:
+                    k = str(kw).strip().lower()
+                    if k:
+                        self._file_keyword_counts[source_path][k] += 1
+
+    def _rank_files_for_query(
+        self,
+        *,
+        scored: list[tuple[int, float]],
+        query_keywords: set[str],
+        explicit_targets: list[str],
+        max_files: int,
+    ) -> list[dict]:
+        file_scores: dict[str, float] = defaultdict(float)
+
+        if scored:
+            for idx, score in scored:
+                if idx < 0 or idx >= len(self._facts):
+                    continue
+                fact = self._facts[idx]
+                source_file = str(fact.get("source_file", "") or "").strip()
+                source_path = str(fact.get("source_path", source_file) or source_file).strip()
+                if not source_path:
+                    continue
+                file_scores[source_path] += float(score)
+
+        for path, indices in self._file_to_indices.items():
+            if path not in file_scores:
+                file_scores[path] += min(len(indices), 6) * 0.08
+
+        for path in list(file_scores.keys()):
+            kw_counter = self._file_keyword_counts.get(path, Counter())
+            kw_bonus = sum(kw_counter.get(k, 0) for k in query_keywords)
+            file_scores[path] += min(kw_bonus, 8) * 0.2
+            source_name = Path(path).name
+            file_scores[path] += _explicit_target_score(explicit_targets, path, source_name)
+
+        ranked_paths = sorted(file_scores.items(), key=lambda item: item[1], reverse=True)
+        out: list[dict] = []
+        for path, score in ranked_paths[:max_files]:
+            out.append(
+                {
+                    "path": path,
+                    "score": float(score),
+                    "chunks": len(self._file_to_indices.get(path, [])),
+                    "tags": sorted(self._file_tags.get(path, set())),
+                }
+            )
+        return out
 
 
 def _extract_query_keywords(text: str) -> set[str]:

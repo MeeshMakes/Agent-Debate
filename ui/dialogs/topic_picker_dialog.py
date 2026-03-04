@@ -2725,6 +2725,11 @@ class TopicPickerDialog(QDialog):
                     f"{sid}: winner={winner} margin={margin or 'n/a'} turns={turns} summary={summary[:160]}"
                 )
 
+        repo_intelligence = self._build_refine_repo_delta_context(
+            sessions=ordered,
+            current_session_id=sessions[0].session_id if sessions else "",
+        )
+
         return {
             "thread_session_count": len(ordered),
             "thread_session_ids": [m.session_id for m in ordered],
@@ -2743,7 +2748,88 @@ class TopicPickerDialog(QDialog):
             "covered_ground": covered_ground,
             "transcript_signals": transcript_signals,
             "scoring_trend": scoring_trend[:24],
+            "repo_intelligence": repo_intelligence,
         }
+
+    @staticmethod
+    def _extract_refine_repo_meta_from_brief(brief: dict) -> tuple[str, str]:
+        if not isinstance(brief, dict):
+            return "", ""
+        repo_path = str(brief.get("repo_path", "") or "").strip()
+        snapshot_at = str(
+            brief.get("repo_snapshot_generated_at", "")
+            or brief.get("snapshot_generated_at", "")
+            or ""
+        ).strip()
+        return repo_path, snapshot_at
+
+    def _build_refine_repo_delta_context(self, *, sessions: list[SessionMeta], current_session_id: str) -> dict:
+        ordered = sorted(sessions, key=lambda m: m.start_ts)
+        sm = get_session_manager()
+
+        latest_repo_path = ""
+        latest_snapshot_ts = ""
+        baseline_snapshot_ts = ""
+        baseline_session_id = ""
+
+        for meta in reversed(ordered):
+            brief = sm.load_session_brief(meta.session_id)
+            if not isinstance(brief, dict):
+                continue
+            repo_path, snapshot_ts = self._extract_refine_repo_meta_from_brief(brief)
+            if repo_path and not latest_repo_path:
+                latest_repo_path = repo_path
+            if snapshot_ts and not latest_snapshot_ts:
+                latest_snapshot_ts = snapshot_ts
+            if snapshot_ts and meta.session_id != current_session_id and not baseline_snapshot_ts:
+                baseline_snapshot_ts = snapshot_ts
+                baseline_session_id = meta.session_id
+            if latest_repo_path and baseline_snapshot_ts:
+                break
+
+        if not latest_repo_path:
+            fallback_repo = self._repo_path_edit.text().strip()
+            if fallback_repo:
+                latest_repo_path = fallback_repo
+
+        if not baseline_snapshot_ts:
+            baseline_snapshot_ts = latest_snapshot_ts
+
+        if not latest_repo_path:
+            return {
+                "enabled": False,
+                "message": "No linked repository metadata found for this thread.",
+            }
+
+        try:
+            delta = self._repo_watchdog.build_repo_delta_intelligence(
+                latest_repo_path,
+                baseline_generated_at=baseline_snapshot_ts,
+                max_files=60,
+                refresh_snapshot=True,
+            )
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "repo_path": latest_repo_path,
+                "baseline_snapshot_generated_at": baseline_snapshot_ts,
+                "baseline_session_id": baseline_session_id,
+                "error": str(exc),
+            }
+
+        if not isinstance(delta, dict):
+            return {
+                "enabled": True,
+                "repo_path": latest_repo_path,
+                "baseline_snapshot_generated_at": baseline_snapshot_ts,
+                "baseline_session_id": baseline_session_id,
+                "message": "Repository delta intelligence returned no data.",
+            }
+
+        delta["enabled"] = True
+        delta["baseline_snapshot_generated_at"] = baseline_snapshot_ts
+        delta["baseline_session_id"] = baseline_session_id
+        return delta
 
     def _collect_refine_session_signals(self, session_id: str) -> dict:
         sm = get_session_manager()
@@ -3411,6 +3497,8 @@ class TopicPickerDialog(QDialog):
             "talking_points": tp_lines,
             "mode": "repo_watchdog" if (is_custom and self._mode_repo_rb.isChecked()) else "static_ingestion",
             "repo_path": self._repo_path_edit.text().strip() if (is_custom and self._mode_repo_rb.isChecked()) else "",
+            "repo_snapshot_generated_at": "",
+            "repo_snapshot_id": "",
             "debate_id": self._active_custom_id or "",
             "talking_point_key": selected_tp_key,
             "source_session_id": self._seed_source_session_id,
@@ -3468,18 +3556,60 @@ class TopicPickerDialog(QDialog):
             finally:
                 self._set_repo_busy(False)
 
+            baseline_snapshot_ts = self._latest_repo_baseline_snapshot_for_tp(selected_tp_key)
+            try:
+                delta_ctx = self._repo_watchdog.build_repo_delta_intelligence(
+                    str(repo_path),
+                    baseline_generated_at=baseline_snapshot_ts,
+                    max_files=60,
+                    refresh_snapshot=False,
+                )
+            except Exception:
+                delta_ctx = {}
+
+            delta_section = ""
+            if isinstance(delta_ctx, dict) and delta_ctx:
+                counts = delta_ctx.get("change_counts", {}) if isinstance(delta_ctx.get("change_counts", {}), dict) else {}
+                c_added = int(counts.get("added", 0) or 0)
+                c_mod = int(counts.get("modified", 0) or 0)
+                c_del = int(counts.get("deleted", 0) or 0)
+                mod_summaries = delta_ctx.get("module_change_summaries", []) if isinstance(delta_ctx.get("module_change_summaries", []), list) else []
+                mod_lines = "\n".join(f"  • {str(line).strip()}" for line in mod_summaries[:18] if str(line).strip())
+                if not mod_lines:
+                    mod_lines = "  • (none)"
+
+                delta_section = (
+                    "\n\nREPO CHANGE INTELLIGENCE (since prior session baseline):\n"
+                    f"Baseline snapshot: {baseline_snapshot_ts or '(none)'}\n"
+                    f"Current snapshot: {snapshot.generated_at}\n"
+                    f"Changes: added={c_added}, modified={c_mod}, deleted={c_del}\n"
+                    "AST/module-level deltas:\n"
+                    f"{mod_lines}\n"
+                    "Use this to mark previous debate issues as resolved, partially implemented, or still open."
+                )
+
             full_context = (
                 f"{full_context}\n\n"
                 "REPO MODE: This debate is linked to a live repository.\n"
                 "Use the repository snapshot for global understanding, then inspect real files for final claims.\n\n"
                 f"{brief}"
+                f"{delta_section}"
             )
 
             marker = {
                 "mode": "repo_watchdog",
                 "repo_path": str(repo_path.resolve()),
                 "snapshot_generated_at": snapshot.generated_at,
+                "snapshot_id": snapshot.snapshot_id,
             }
+            get_session_manager().pending_session_brief.update(
+                {
+                    "repo_snapshot_generated_at": snapshot.generated_at,
+                    "repo_snapshot_id": snapshot.snapshot_id,
+                    "repo_baseline_snapshot_generated_at": baseline_snapshot_ts,
+                    "repo_delta": delta_ctx if isinstance(delta_ctx, dict) else {},
+                }
+            )
             full_context += f"\n\n[REPO_WATCHDOG_META]{json.dumps(marker)}[/REPO_WATCHDOG_META]"
 
         files = (
@@ -3502,6 +3632,24 @@ class TopicPickerDialog(QDialog):
         legacy = _tp_key(debate.title, legacy_first_tp)
         legacy_sessions = sm.list_sessions_for_tp(sm.effective_tp_key(legacy))
         return legacy if legacy_sessions else stable
+
+    def _latest_repo_baseline_snapshot_for_tp(self, tp_key: str) -> str:
+        if not tp_key:
+            return ""
+        sm = get_session_manager()
+        sessions = sm.list_sessions_for_tp(tp_key)
+        for meta in sessions:
+            brief = sm.load_session_brief(meta.session_id)
+            if not isinstance(brief, dict):
+                continue
+            snap = str(
+                brief.get("repo_snapshot_generated_at", "")
+                or brief.get("snapshot_generated_at", "")
+                or ""
+            ).strip()
+            if snap:
+                return snap
+        return ""
 
     def _load_session_brief_into_editor(self, session_id: str) -> None:
         data = get_session_manager().load_session_brief(session_id)

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -534,6 +535,22 @@ class MainWindow(QMainWindow):
         self._repo_watchdog_timer.timeout.connect(self._poll_repo_watchdog)
         self._repo_watchdog_worker: _RepoWatchdogPollWorker | None = None
         self._repo_watchdog_epoch: int = 0
+        self._live_progress_tick = QTimer(self)
+        self._live_progress_tick.setInterval(1000)
+        self._live_progress_tick.timeout.connect(self._tick_live_progress)
+        self._live_progress_started_at: float = 0.0
+        self._live_progress_last_signal_at: float = 0.0
+        self._live_progress_last_turn_at: float = 0.0
+        self._live_progress_turn_durations: list[float] = []
+        self._live_progress_base_turn: int = 0
+        self._live_progress_target_turn: int = 0
+        self._live_progress_last_completed_turn: int = 0
+        self._live_progress_endless: bool = False
+        self._live_progress_phase: str = "Idle"
+        self._live_progress_spinner_idx: int = 0
+        self._live_progress_bar: QProgressBar | None = None
+        self._live_progress_lbl: QLabel | None = None
+        self._live_progress_eta_lbl: QLabel | None = None
 
         # -- panels --
         self.left_panel = LeftAgentPanel()
@@ -1044,6 +1061,189 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(_scroll_wrap)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+        progress_toolbar = QToolBar("Debate Progress")
+        progress_toolbar.setObjectName("liveProgressToolbar")
+        progress_toolbar.setMovable(False)
+
+        progress_container = QWidget()
+        progress_container.setObjectName("liveProgressContainer")
+        progress_container.setFixedHeight(28)
+        progress_layout = QHBoxLayout(progress_container)
+        progress_layout.setContentsMargins(8, 2, 8, 2)
+        progress_layout.setSpacing(10)
+
+        self._live_progress_lbl = QLabel("● Idle")
+        self._live_progress_lbl.setObjectName("liveProgressLabel")
+        self._live_progress_lbl.setMinimumWidth(300)
+        self._live_progress_lbl.setStyleSheet("color: #78909c; font-size: 9pt; font-weight: 600;")
+
+        self._live_progress_bar = QProgressBar()
+        self._live_progress_bar.setObjectName("liveDebateProgressBar")
+        self._live_progress_bar.setRange(0, 100)
+        self._live_progress_bar.setValue(0)
+        self._live_progress_bar.setTextVisible(False)
+        self._live_progress_bar.setFixedHeight(12)
+        self._live_progress_bar.setStyleSheet(
+            "QProgressBar { background: #0c1522; border: 1px solid #1f3550; border-radius: 5px; }"
+            "QProgressBar::chunk { background: #00acc1; border-radius: 4px; }"
+        )
+
+        self._live_progress_eta_lbl = QLabel("ETA --:--")
+        self._live_progress_eta_lbl.setObjectName("liveProgressEtaLabel")
+        self._live_progress_eta_lbl.setStyleSheet("color: #90a4ae; font-size: 9pt; font-weight: 700;")
+
+        progress_layout.addWidget(self._live_progress_lbl)
+        progress_layout.addWidget(self._live_progress_bar, stretch=1)
+        progress_layout.addWidget(self._live_progress_eta_lbl)
+        progress_toolbar.addWidget(progress_container)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, progress_toolbar)
+        self._set_live_progress_idle()
+
+    @staticmethod
+    def _format_runtime(seconds: float) -> str:
+        total = max(0, int(seconds))
+        mins, secs = divmod(total, 60)
+        hrs, mins = divmod(mins, 60)
+        if hrs:
+            return f"{hrs}:{mins:02d}:{secs:02d}"
+        return f"{mins:02d}:{secs:02d}"
+
+    def _set_live_progress_idle(self) -> None:
+        self._live_progress_tick.stop()
+        self._live_progress_started_at = 0.0
+        self._live_progress_last_signal_at = 0.0
+        self._live_progress_last_turn_at = 0.0
+        self._live_progress_turn_durations = []
+        self._live_progress_base_turn = 0
+        self._live_progress_target_turn = 0
+        self._live_progress_last_completed_turn = 0
+        self._live_progress_endless = False
+        self._live_progress_phase = "Idle"
+        self._live_progress_spinner_idx = 0
+        if self._live_progress_bar is not None:
+            self._live_progress_bar.setRange(0, 100)
+            self._live_progress_bar.setValue(0)
+        if self._live_progress_lbl is not None:
+            self._live_progress_lbl.setText("● Idle — waiting to start")
+            self._live_progress_lbl.setStyleSheet("color: #78909c; font-size: 9pt; font-weight: 600;")
+        if self._live_progress_eta_lbl is not None:
+            self._live_progress_eta_lbl.setText("ETA --:--")
+
+    def _start_live_progress(self, *, planned_turns: int, endless: bool, base_turn: int, phase: str) -> None:
+        now = time.monotonic()
+        self._live_progress_started_at = now
+        self._live_progress_last_signal_at = now
+        self._live_progress_last_turn_at = 0.0
+        self._live_progress_turn_durations = []
+        self._live_progress_base_turn = max(0, int(base_turn))
+        self._live_progress_target_turn = self._live_progress_base_turn + max(0, int(planned_turns))
+        self._live_progress_last_completed_turn = 0
+        self._live_progress_endless = bool(endless)
+        self._live_progress_phase = phase
+        self._live_progress_spinner_idx = 0
+
+        if self._live_progress_bar is not None:
+            if self._live_progress_endless:
+                self._live_progress_bar.setRange(0, 0)
+            else:
+                total_turns = max(1, self._live_progress_target_turn - self._live_progress_base_turn)
+                self._live_progress_bar.setRange(0, total_turns)
+                self._live_progress_bar.setValue(0)
+
+        if not self._live_progress_tick.isActive():
+            self._live_progress_tick.start()
+        self._render_live_progress()
+
+    def _set_live_progress_phase(self, phase: str) -> None:
+        if not phase:
+            return
+        self._live_progress_phase = phase
+        self._live_progress_last_signal_at = time.monotonic()
+        self._render_live_progress()
+
+    def _record_live_progress_turn(self, absolute_turn: int, agent: str) -> None:
+        now = time.monotonic()
+        completed = max(0, int(absolute_turn) - self._live_progress_base_turn)
+        if completed > self._live_progress_last_completed_turn:
+            if self._live_progress_last_turn_at > 0:
+                delta = now - self._live_progress_last_turn_at
+                if 0.5 <= delta <= 600:
+                    self._live_progress_turn_durations.append(delta)
+                    if len(self._live_progress_turn_durations) > 20:
+                        self._live_progress_turn_durations = self._live_progress_turn_durations[-20:]
+            self._live_progress_last_turn_at = now
+            self._live_progress_last_completed_turn = completed
+
+        if self._live_progress_bar is not None and not self._live_progress_endless:
+            self._live_progress_bar.setValue(
+                max(0, min(self._live_progress_bar.maximum(), self._live_progress_last_completed_turn))
+            )
+        self._set_live_progress_phase(f"{agent} completed turn {absolute_turn}")
+
+    def _render_live_progress(self) -> None:
+        if self._live_progress_lbl is None or self._live_progress_eta_lbl is None:
+            return
+
+        spinner = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+        spin = spinner[self._live_progress_spinner_idx % len(spinner)]
+        if self._live_progress_started_at <= 0:
+            self._live_progress_lbl.setText("● Idle — waiting to start")
+            self._live_progress_eta_lbl.setText("ETA --:--")
+            return
+
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._live_progress_started_at)
+        since_signal = max(0, int(now - self._live_progress_last_signal_at))
+
+        if self._live_progress_endless:
+            self._live_progress_lbl.setText(
+                f"{spin} {self._live_progress_phase}  ·  elapsed {self._format_runtime(elapsed)}  ·  last signal {since_signal}s ago"
+            )
+            self._live_progress_eta_lbl.setText("ETA ∞")
+            return
+
+        total_turns = max(1, self._live_progress_target_turn - self._live_progress_base_turn)
+        completed = max(0, min(total_turns, self._live_progress_last_completed_turn))
+        remaining = max(0, total_turns - completed)
+
+        if completed > 0:
+            avg_turn = (
+                sum(self._live_progress_turn_durations) / len(self._live_progress_turn_durations)
+                if self._live_progress_turn_durations
+                else elapsed / completed
+            )
+            eta_seconds = int(max(0.0, remaining * avg_turn))
+            eta_text = f"ETA ~{self._format_runtime(eta_seconds)}"
+        else:
+            eta_text = "ETA estimating…"
+
+        self._live_progress_lbl.setText(
+            f"{spin} {self._live_progress_phase}  ·  {completed}/{total_turns} turns  ·  elapsed {self._format_runtime(elapsed)}  ·  last signal {since_signal}s ago"
+        )
+        self._live_progress_eta_lbl.setText(eta_text)
+
+    def _tick_live_progress(self) -> None:
+        if self._live_progress_started_at <= 0:
+            return
+        self._live_progress_spinner_idx += 1
+        self._render_live_progress()
+
+    def _complete_live_progress(self, phase: str) -> None:
+        if self._live_progress_started_at <= 0:
+            self._set_live_progress_idle()
+            return
+
+        self._live_progress_phase = phase
+        self._live_progress_last_signal_at = time.monotonic()
+        if self._live_progress_bar is not None and not self._live_progress_endless:
+            total_turns = max(1, self._live_progress_target_turn - self._live_progress_base_turn)
+            self._live_progress_bar.setRange(0, total_turns)
+            self._live_progress_bar.setValue(total_turns)
+        self._render_live_progress()
+        self._live_progress_tick.stop()
+        QTimer.singleShot(7000, self._set_live_progress_idle)
+
     # ------------------------------------------------------------------ events
 
     def _bind_events(self) -> None:
@@ -1197,6 +1397,7 @@ class MainWindow(QMainWindow):
         self._current_tts_char_offset = 0
         self.scoring_panel.new_session("")
         self._update_stats_bar({}, 0)
+        self._set_live_progress_idle()
 
     def _load_repo_dataset_into_orchestrator(self) -> bool:
         if self.orchestrator is None or not self._repo_watchdog_meta:
@@ -1553,6 +1754,12 @@ class MainWindow(QMainWindow):
         self.worker = DebateWorker(self.orchestrator, topic=topic, turns=turns, endless=endless)
         self.worker.event_signal.connect(self.handle_event)
         self.worker.done_signal.connect(self._on_debate_done)
+        self._start_live_progress(
+            planned_turns=turns,
+            endless=endless,
+            base_turn=0,
+            phase="Starting debate engines",
+        )
         self.worker.start()
         self._set_debate_transport_state("running")
         self._start_repo_watchdog()
@@ -1571,6 +1778,7 @@ class MainWindow(QMainWindow):
         self.orchestrator.stop()
         self._stop_repo_watchdog()
         self._set_debate_transport_state("pausing")
+        self._set_live_progress_phase("Stop requested — finishing current turn")
         self._status_bar.showMessage("Stop requested — finishing current turn...")
 
     def _start_repo_watchdog(self) -> None:
@@ -1662,12 +1870,14 @@ class MainWindow(QMainWindow):
         if checked:
             self.orchestrator.pause()
             self._set_debate_transport_state("pausing")
+            self._set_live_progress_phase("Pause requested — waiting for pair boundary")
             self._status_bar.showMessage("Pause requested — waiting for both agents to finish their turn…")
         else:
             # Manual uncheck (resume without injection)
             self.orchestrator.resume()
             self.arbiter_panel.set_paused_state(False)
             self._set_debate_transport_state("running")
+            self._set_live_progress_phase("Debate resumed")
             self._status_bar.showMessage("Debate resumed.")
 
     def _continue_debate(self) -> None:
@@ -1691,6 +1901,12 @@ class MainWindow(QMainWindow):
         )
         self.worker.event_signal.connect(self.handle_event)
         self.worker.done_signal.connect(self._on_debate_done)
+        self._start_live_progress(
+            planned_turns=extra_turns,
+            endless=False,
+            base_turn=int(getattr(self.orchestrator, "turn_index", 0) or 0),
+            phase="Continuing debate",
+        )
         self.worker.start()
         self._start_repo_watchdog()
         self._status_bar.showMessage(f"Continuing debate for {extra_turns} more turns...")
@@ -1716,10 +1932,12 @@ class MainWindow(QMainWindow):
         self.arbiter_panel.clear_staging()
         self.arbiter_panel.set_paused_state(False)
         self._set_debate_transport_state("running")
+        self._set_live_progress_phase("Arbiter injection delivered — debate resumed")
         self._status_bar.showMessage(f"Injected: “{text[:60]}” — debate resumed.")
 
     def _on_debate_done(self) -> None:
         self._stop_repo_watchdog()
+        self._complete_live_progress("Debate complete")
         self._status_bar.showMessage("Debate complete — press Continue to add more turns")
         left_facts = len(self.orchestrator.left_agent.semantic_memory.facts)
         right_facts = len(self.orchestrator.right_agent.semantic_memory.facts)
@@ -2017,6 +2235,11 @@ class MainWindow(QMainWindow):
                     f"{sid}: winner={winner} margin={margin or 'n/a'} turns={turns} summary={summary[:140]}"
                 )
 
+        repo_intelligence = self._build_repo_delta_context_for_thread(
+            sessions=ordered,
+            current_session_id=current_session_id,
+        )
+
         return {
             "thread_session_count": len(ordered),
             "thread_session_ids": [m.session_id for m in ordered],
@@ -2034,7 +2257,94 @@ class MainWindow(QMainWindow):
             "covered_ground": covered_ground,
             "transcript_signals": transcript_signals,
             "scoring_trend": scoring_trend[:20],
+            "repo_intelligence": repo_intelligence,
         }
+
+    @staticmethod
+    def _extract_repo_snapshot_meta_from_brief(brief: dict) -> tuple[str, str]:
+        if not isinstance(brief, dict):
+            return "", ""
+        repo_path = str(brief.get("repo_path", "") or "").strip()
+        snapshot_at = str(
+            brief.get("repo_snapshot_generated_at", "")
+            or brief.get("snapshot_generated_at", "")
+            or ""
+        ).strip()
+        return repo_path, snapshot_at
+
+    def _build_repo_delta_context_for_thread(
+        self,
+        *,
+        sessions: list,
+        current_session_id: str,
+    ) -> dict:
+        ordered = list(sessions)
+        latest_repo_path = ""
+        latest_snapshot_ts = ""
+        baseline_snapshot_ts = ""
+        baseline_session_id = ""
+
+        sm = get_session_manager()
+        for meta in reversed(ordered):
+            brief = sm.load_session_brief(meta.session_id)
+            if not isinstance(brief, dict):
+                continue
+            repo_path, snapshot_ts = self._extract_repo_snapshot_meta_from_brief(brief)
+            if repo_path and not latest_repo_path:
+                latest_repo_path = repo_path
+            if snapshot_ts and not latest_snapshot_ts:
+                latest_snapshot_ts = snapshot_ts
+            if snapshot_ts and meta.session_id != current_session_id and not baseline_snapshot_ts:
+                baseline_snapshot_ts = snapshot_ts
+                baseline_session_id = meta.session_id
+            if latest_repo_path and baseline_snapshot_ts:
+                break
+
+        if not latest_repo_path:
+            _, marker = self._extract_repo_watchdog_meta(self._current_topic_context)
+            if isinstance(marker, dict):
+                latest_repo_path = str(marker.get("repo_path", "") or "").strip()
+                if not latest_snapshot_ts:
+                    latest_snapshot_ts = str(marker.get("snapshot_generated_at", "") or "").strip()
+
+        if not baseline_snapshot_ts:
+            baseline_snapshot_ts = latest_snapshot_ts
+
+        if not latest_repo_path:
+            return {
+                "enabled": False,
+                "message": "No linked repository metadata found for this thread.",
+            }
+
+        try:
+            delta = self._repo_watchdog.build_repo_delta_intelligence(
+                latest_repo_path,
+                baseline_generated_at=baseline_snapshot_ts,
+                max_files=60,
+                refresh_snapshot=True,
+            )
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "repo_path": latest_repo_path,
+                "baseline_snapshot_generated_at": baseline_snapshot_ts,
+                "baseline_session_id": baseline_session_id,
+                "error": str(exc),
+            }
+
+        if not isinstance(delta, dict):
+            return {
+                "enabled": True,
+                "repo_path": latest_repo_path,
+                "baseline_snapshot_generated_at": baseline_snapshot_ts,
+                "baseline_session_id": baseline_session_id,
+                "message": "Repository delta intelligence returned no data.",
+            }
+
+        delta["enabled"] = True
+        delta["baseline_snapshot_generated_at"] = baseline_snapshot_ts
+        delta["baseline_session_id"] = baseline_session_id
+        return delta
 
     def _collect_session_signals(self, session_id: str) -> dict:
         sm = get_session_manager()
@@ -2521,6 +2831,7 @@ class MainWindow(QMainWindow):
             agent = event.payload["agent"]
             thought = event.payload["thought"]
             turn = event.payload.get("turn", "")
+            self._set_live_progress_phase(f"{agent} reasoning on turn {turn}")
             if agent.lower() == "astra":
                 self.left_panel.append_thought(f"[T{turn}] {thought}")
             else:
@@ -2531,6 +2842,7 @@ class MainWindow(QMainWindow):
             message = event.payload["message"]
             turn    = event.payload.get("turn", 0)
             quality = event.payload.get("quality")
+            self._record_live_progress_turn(turn, agent)
             # Update the turn/speaker indicator in the header
             total_turns = 0 if self._endless_check.isChecked() else self._turns_spin.value()
             self.center_panel.update_turn_indicator(agent, turn, total_turns)
@@ -2624,6 +2936,7 @@ class MainWindow(QMainWindow):
             self._grounding_bar.setValue(pct)
             self._grounding_lbl.setVisible(True)
             self._grounding_bar.setVisible(True)
+            self._set_live_progress_phase(f"Grounding {agent} ({done}/{total})")
 
         elif event.event_type == "grounding_done":
             matched = event.payload.get("matched", 0)
@@ -2675,6 +2988,9 @@ class MainWindow(QMainWindow):
 
         elif event.event_type == "state":
             t = event.payload["transition"]
+            self._set_live_progress_phase(
+                f"State {t.get('current', '')}: {t.get('reason', '')}".strip()
+            )
             self._status_bar.showMessage(
                 f"State: {t['previous']} → {t['current']}  ({t['reason']})"
             )
@@ -2688,6 +3004,7 @@ class MainWindow(QMainWindow):
             self.arbiter_panel.set_message(
                 f"⏸ Debate paused after pair {pair} — type an arbiter intervention below."
             )
+            self._set_live_progress_phase("Paused — waiting for arbiter input")
             self._status_bar.showMessage(
                 "Debate paused — type a message in the bottom composer and press Send"
             )
@@ -2701,6 +3018,7 @@ class MainWindow(QMainWindow):
         elif event.event_type == "resolution":
             # Capture for TopicRefineWorker after session ends
             self._last_resolution_payload = event.payload
+            self._set_live_progress_phase("Building resolution package")
             truths = event.payload.get("truths_discovered", [])
             problems = event.payload.get("problems_found", [])
             subs = event.payload.get("sub_topics_explored", [])

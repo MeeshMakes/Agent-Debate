@@ -72,12 +72,15 @@ class RepoFileSummary:
     char_count: int
     mode: str
     semantic_hash: str
+    ast_signature: str
+    ast_symbols: dict[str, list[str]]
     tags: list[str]
     excerpt: str
 
 
 @dataclass
 class RepoSnapshot:
+    snapshot_id: str
     repo_path: str
     generated_at: str
     included_files: int
@@ -150,9 +153,14 @@ class RepoWatchdog:
             summaries.append(self._summarize_file(repo, file_path, rel, size))
 
         top_large_files.sort(key=lambda item: item["size"], reverse=True)
+        generated_at = datetime.now().isoformat(timespec="seconds")
+        snapshot_id = hashlib.sha1(
+            f"{repo}:{generated_at}:{included}:{len(summaries)}".encode("utf-8", errors="ignore")
+        ).hexdigest()[:12]
         snapshot = RepoSnapshot(
+            snapshot_id=snapshot_id,
             repo_path=str(repo),
-            generated_at=datetime.now().isoformat(timespec="seconds"),
+            generated_at=generated_at,
             included_files=included,
             skipped_files=skipped,
             skipped_reasons=skipped_reasons,
@@ -163,21 +171,173 @@ class RepoWatchdog:
 
         profile_dir = self._profile_dir(repo)
         profile_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_payload = {
+            **asdict(snapshot),
+            "summaries": [asdict(item) for item in snapshot.summaries],
+        }
         (profile_dir / "snapshot.json").write_text(
-            json.dumps(
-                {
-                    **asdict(snapshot),
-                    "summaries": [asdict(item) for item in snapshot.summaries],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(snapshot_payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        self._archive_snapshot_payload(profile_dir, snapshot_payload)
         self._write_docs_index(profile_dir, repo, summaries)
         self.build_semantic_dataset(str(repo))
         self._write_state(repo, profile_dir)
         return snapshot
+
+    def build_repo_delta_intelligence(
+        self,
+        repo_path: str,
+        *,
+        baseline_generated_at: str = "",
+        max_files: int = 50,
+        refresh_snapshot: bool = True,
+    ) -> dict:
+        repo = Path(repo_path).resolve()
+        if not repo.exists() or not repo.is_dir():
+            return {
+                "repo_path": str(repo),
+                "error": "repo_not_found",
+                "message": "Repository path does not exist.",
+            }
+
+        profile_dir = self._profile_dir(repo)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        current_snapshot = self.build_snapshot(str(repo)) if refresh_snapshot else self._load_latest_snapshot(profile_dir)
+        if current_snapshot is None:
+            return {
+                "repo_path": str(repo),
+                "error": "no_current_snapshot",
+                "message": "No current repository snapshot is available.",
+            }
+
+        baseline_snapshot = self._load_snapshot_by_generated_at(profile_dir, baseline_generated_at)
+        if baseline_snapshot is None:
+            baseline_snapshot = self._load_previous_snapshot(profile_dir, current_snapshot.generated_at)
+
+        if baseline_snapshot is None:
+            nav = self.build_repo_navigation_map(str(repo), max_files=max_files)
+            return {
+                "repo_path": str(repo),
+                "baseline_generated_at": "",
+                "current_generated_at": current_snapshot.generated_at,
+                "baseline_snapshot_id": "",
+                "current_snapshot_id": current_snapshot.snapshot_id,
+                "change_counts": {"added": 0, "modified": 0, "deleted": 0, "touched": 0},
+                "added": [],
+                "modified": [],
+                "deleted": [],
+                "ast_changes": [],
+                "module_change_summaries": [],
+                "navigation_map": nav,
+                "message": "No historical baseline snapshot was available. Current repository map refreshed.",
+            }
+
+        old_map = {s.relative_path: s for s in baseline_snapshot.summaries}
+        new_map = {s.relative_path: s for s in current_snapshot.summaries}
+
+        old_paths = set(old_map.keys())
+        new_paths = set(new_map.keys())
+        added = sorted(new_paths - old_paths)
+        deleted = sorted(old_paths - new_paths)
+
+        modified: list[str] = []
+        for rel in sorted(old_paths & new_paths):
+            old_item = old_map[rel]
+            new_item = new_map[rel]
+            if old_item.semantic_hash != new_item.semantic_hash:
+                modified.append(rel)
+
+        touched = (added + modified + deleted)[:max_files]
+
+        ast_changes: list[dict] = []
+        for rel in (added + modified)[:max_files]:
+            old_symbols = old_map[rel].ast_symbols if rel in old_map else {}
+            new_symbols = new_map[rel].ast_symbols if rel in new_map else {}
+            symbol_delta = self._build_symbol_delta(rel, old_symbols, new_symbols)
+            if symbol_delta:
+                ast_changes.append(symbol_delta)
+
+        module_summaries: list[str] = []
+        for rel in touched[:24]:
+            if rel in added:
+                kind = "added"
+            elif rel in modified:
+                kind = "modified"
+            else:
+                kind = "deleted"
+            delta = next((d for d in ast_changes if d.get("path") == rel), None)
+            if isinstance(delta, dict):
+                adds = ", ".join(delta.get("added", [])[:4])
+                rems = ", ".join(delta.get("removed", [])[:4])
+                extra = ""
+                if adds:
+                    extra += f" | + {adds}"
+                if rems:
+                    extra += f" | - {rems}"
+                module_summaries.append(f"{kind.upper()}: {rel}{extra}")
+            else:
+                module_summaries.append(f"{kind.upper()}: {rel}")
+
+        nav = self.build_repo_navigation_map(str(repo), max_files=max_files)
+
+        return {
+            "repo_path": str(repo),
+            "baseline_generated_at": baseline_snapshot.generated_at,
+            "current_generated_at": current_snapshot.generated_at,
+            "baseline_snapshot_id": baseline_snapshot.snapshot_id,
+            "current_snapshot_id": current_snapshot.snapshot_id,
+            "change_counts": {
+                "added": len(added),
+                "modified": len(modified),
+                "deleted": len(deleted),
+                "touched": len(touched),
+            },
+            "added": added[:max_files],
+            "modified": modified[:max_files],
+            "deleted": deleted[:max_files],
+            "ast_changes": ast_changes[:max_files],
+            "module_change_summaries": module_summaries,
+            "navigation_map": nav,
+            "message": (
+                f"Compared repo snapshot {baseline_snapshot.generated_at} → {current_snapshot.generated_at}: "
+                f"added={len(added)}, modified={len(modified)}, deleted={len(deleted)}"
+            ),
+        }
+
+    def build_repo_navigation_map(self, repo_path: str, *, max_files: int = 80) -> dict:
+        repo = Path(repo_path).resolve()
+        profile_dir = self._profile_dir(repo)
+        snapshot = self._load_latest_snapshot(profile_dir)
+        if snapshot is None:
+            snapshot = self.build_snapshot(str(repo))
+
+        summaries = snapshot.summaries if snapshot is not None else []
+        prioritized = self._prioritized_paths(summaries)
+        summary_by_path = {s.relative_path: s for s in summaries}
+
+        files: list[dict] = []
+        for rel in prioritized[:max_files]:
+            s = summary_by_path.get(rel)
+            if s is None:
+                continue
+            files.append(
+                {
+                    "path": rel,
+                    "tags": list(s.tags),
+                    "line_count": int(s.line_count),
+                    "size": int(s.size),
+                    "ast_signature": s.ast_signature,
+                }
+            )
+
+        return {
+            "generated_at": snapshot.generated_at if snapshot is not None else "",
+            "snapshot_id": snapshot.snapshot_id if snapshot is not None else "",
+            "files": files,
+            "total_files": len(summaries),
+        }
 
     def estimate_repo_size_bytes(self, repo_path: str) -> int:
         repo = Path(repo_path).resolve()
@@ -522,6 +682,8 @@ class RepoWatchdog:
                 char_count=0,
                 mode="unreadable",
                 semantic_hash="",
+                ast_signature="",
+                ast_symbols={},
                 tags=[],
                 excerpt="",
             )
@@ -531,6 +693,8 @@ class RepoWatchdog:
         char_count = len(text)
         semantic_hash = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
         tags = self._derive_tags(rel, text)
+        ast_symbols = self._extract_ast_symbols(rel, text)
+        ast_signature = self._build_ast_signature(ast_symbols)
 
         if size <= _MAX_FILE_BYTES and len(text) <= 4 * _MAX_SNIPPET_CHARS:
             excerpt = text[: _MAX_SNIPPET_CHARS * 2]
@@ -549,9 +713,241 @@ class RepoWatchdog:
             char_count=char_count,
             mode=mode,
             semantic_hash=semantic_hash,
+            ast_signature=ast_signature,
+            ast_symbols=ast_symbols,
             tags=tags,
             excerpt=excerpt,
         )
+
+    def _extract_ast_symbols(self, rel: str, text: str) -> dict[str, list[str]]:
+        ext = Path(rel).suffix.lower()
+        classes: set[str] = set()
+        functions: set[str] = set()
+        methods: set[str] = set()
+        exports: set[str] = set()
+
+        if ext == ".py":
+            for m in re.finditer(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.MULTILINE):
+                classes.add(m.group(1))
+            for m in re.finditer(r"^(\s*)def\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.MULTILINE):
+                indent = m.group(1)
+                name = m.group(2)
+                if indent:
+                    methods.add(name)
+                else:
+                    functions.add(name)
+
+        elif ext in {".js", ".jsx", ".ts", ".tsx"}:
+            for m in re.finditer(r"\bclass\s+([A-Za-z_$][A-Za-z0-9_$]*)", text):
+                classes.add(m.group(1))
+            for m in re.finditer(r"\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(", text):
+                functions.add(m.group(1))
+            for m in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\([^)]*\)\s*=>", text):
+                functions.add(m.group(1))
+            for m in re.finditer(r"\bexport\s+(?:default\s+)?(?:class|function|const|let|var)?\s*([A-Za-z_$][A-Za-z0-9_$]*)", text):
+                if m.group(1):
+                    exports.add(m.group(1))
+
+        elif ext in {".go"}:
+            for m in re.finditer(r"\btype\s+([A-Za-z_][A-Za-z0-9_]*)\s+struct\b", text):
+                classes.add(m.group(1))
+            for m in re.finditer(r"\bfunc\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+                functions.add(m.group(1))
+
+        out: dict[str, list[str]] = {}
+        if classes:
+            out["classes"] = sorted(classes)
+        if functions:
+            out["functions"] = sorted(functions)
+        if methods:
+            out["methods"] = sorted(methods)
+        if exports:
+            out["exports"] = sorted(exports)
+        return out
+
+    def _build_ast_signature(self, symbols: dict[str, list[str]]) -> str:
+        if not symbols:
+            return ""
+        parts: list[str] = []
+        for kind in sorted(symbols.keys()):
+            names = symbols.get(kind, [])
+            if not isinstance(names, list):
+                continue
+            for name in names:
+                n = str(name).strip()
+                if n:
+                    parts.append(f"{kind}:{n}")
+        if not parts:
+            return ""
+        return hashlib.sha1("|".join(parts).encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    def _build_symbol_delta(self, path: str, old_symbols: dict, new_symbols: dict) -> dict | None:
+        old_map = old_symbols if isinstance(old_symbols, dict) else {}
+        new_map = new_symbols if isinstance(new_symbols, dict) else {}
+
+        old_flat: set[str] = set()
+        new_flat: set[str] = set()
+        for kind, names in old_map.items():
+            if isinstance(names, list):
+                old_flat.update(f"{kind}:{str(n).strip()}" for n in names if str(n).strip())
+        for kind, names in new_map.items():
+            if isinstance(names, list):
+                new_flat.update(f"{kind}:{str(n).strip()}" for n in names if str(n).strip())
+
+        added = sorted(new_flat - old_flat)
+        removed = sorted(old_flat - new_flat)
+        if not added and not removed:
+            return None
+
+        return {
+            "path": path,
+            "added": added[:20],
+            "removed": removed[:20],
+        }
+
+    def _archive_snapshot_payload(self, profile_dir: Path, payload: dict) -> None:
+        archive = profile_dir / "snapshots"
+        archive.mkdir(parents=True, exist_ok=True)
+        generated = str(payload.get("generated_at", "") or datetime.now().isoformat(timespec="seconds"))
+        safe_ts = generated.replace(":", "-").replace("/", "-")
+        file_path = archive / f"snapshot_{safe_ts}.json"
+        if file_path.exists():
+            sid = str(payload.get("snapshot_id", "") or hashlib.sha1(generated.encode("utf-8", errors="ignore")).hexdigest()[:6])
+            file_path = archive / f"snapshot_{safe_ts}_{sid}.json"
+        file_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        archived = sorted(archive.glob("snapshot_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in archived[60:]:
+            stale.unlink(missing_ok=True)
+
+    def _snapshot_from_dict(self, data: dict) -> RepoSnapshot | None:
+        if not isinstance(data, dict):
+            return None
+        summaries_raw = data.get("summaries", [])
+        summaries: list[RepoFileSummary] = []
+        if isinstance(summaries_raw, list):
+            for item in summaries_raw:
+                if not isinstance(item, dict):
+                    continue
+                summaries.append(
+                    RepoFileSummary(
+                        relative_path=str(item.get("relative_path", "") or ""),
+                        size=int(item.get("size", 0) or 0),
+                        line_count=int(item.get("line_count", 0) or 0),
+                        char_count=int(item.get("char_count", 0) or 0),
+                        mode=str(item.get("mode", "") or ""),
+                        semantic_hash=str(item.get("semantic_hash", "") or ""),
+                        ast_signature=str(item.get("ast_signature", "") or ""),
+                        ast_symbols=item.get("ast_symbols", {}) if isinstance(item.get("ast_symbols", {}), dict) else {},
+                        tags=[str(t).strip() for t in item.get("tags", []) if str(t).strip()] if isinstance(item.get("tags", []), list) else [],
+                        excerpt=str(item.get("excerpt", "") or ""),
+                    )
+                )
+
+        snapshot_id = str(data.get("snapshot_id", "") or "").strip()
+        generated_at = str(data.get("generated_at", "") or "").strip()
+        repo_path = str(data.get("repo_path", "") or "").strip()
+        if not snapshot_id and generated_at:
+            snapshot_id = hashlib.sha1(f"{repo_path}:{generated_at}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+        return RepoSnapshot(
+            snapshot_id=snapshot_id,
+            repo_path=repo_path,
+            generated_at=generated_at,
+            included_files=int(data.get("included_files", len(summaries)) or len(summaries)),
+            skipped_files=int(data.get("skipped_files", 0) or 0),
+            skipped_reasons=data.get("skipped_reasons", {}) if isinstance(data.get("skipped_reasons", {}), dict) else {},
+            extension_counts=data.get("extension_counts", {}) if isinstance(data.get("extension_counts", {}), dict) else {},
+            top_large_files=data.get("top_large_files", []) if isinstance(data.get("top_large_files", []), list) else [],
+            summaries=summaries,
+        )
+
+    def _load_latest_snapshot(self, profile_dir: Path) -> RepoSnapshot | None:
+        snapshot_file = profile_dir / "snapshot.json"
+        if snapshot_file.exists():
+            try:
+                data = json.loads(snapshot_file.read_text(encoding="utf-8"))
+                snap = self._snapshot_from_dict(data)
+                if snap is not None:
+                    return snap
+            except Exception:
+                pass
+
+        archive = profile_dir / "snapshots"
+        if not archive.exists():
+            return None
+        files = sorted(archive.glob("snapshot_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for fp in files:
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                snap = self._snapshot_from_dict(data)
+                if snap is not None:
+                    return snap
+            except Exception:
+                continue
+        return None
+
+    def _load_previous_snapshot(self, profile_dir: Path, current_generated_at: str) -> RepoSnapshot | None:
+        archive = profile_dir / "snapshots"
+        if not archive.exists():
+            return None
+        current_ts = self._to_epoch(current_generated_at)
+        entries: list[tuple[float, RepoSnapshot]] = []
+        for fp in archive.glob("snapshot_*.json"):
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            snap = self._snapshot_from_dict(data)
+            if snap is None:
+                continue
+            ts = self._to_epoch(snap.generated_at)
+            entries.append((ts, snap))
+        if not entries:
+            return None
+        entries.sort(key=lambda item: item[0], reverse=True)
+        for ts, snap in entries:
+            if current_ts <= 0 or ts < current_ts:
+                return snap
+        return None
+
+    def _load_snapshot_by_generated_at(self, profile_dir: Path, generated_at: str) -> RepoSnapshot | None:
+        target = (generated_at or "").strip()
+        if not target:
+            return None
+        target_ts = self._to_epoch(target)
+        if target_ts <= 0:
+            return None
+
+        archive = profile_dir / "snapshots"
+        if not archive.exists():
+            return None
+
+        best: tuple[float, RepoSnapshot] | None = None
+        for fp in archive.glob("snapshot_*.json"):
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            snap = self._snapshot_from_dict(data)
+            if snap is None:
+                continue
+            ts = self._to_epoch(snap.generated_at)
+            if ts <= 0:
+                continue
+            if ts <= target_ts and (best is None or ts > best[0]):
+                best = (ts, snap)
+
+        return best[1] if best is not None else None
+
+    def _to_epoch(self, value: str) -> float:
+        ts = (value or "").strip()
+        if not ts:
+            return 0.0
+        try:
+            return datetime.fromisoformat(ts).timestamp()
+        except Exception:
+            return 0.0
 
     def _derive_tags(self, rel: str, text: str) -> list[str]:
         tags: set[str] = set()

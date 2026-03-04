@@ -40,6 +40,9 @@ class TopicRefineWorker(QThread):
         "  - Integrate session truths as established context, not repeated debate questions.\n"
         "  - Use unresolved tensions, low-quality dimensions, verdict rationale, and transcript signals to shape new focus.\n"
         "  - Do NOT rehash solved/covered ground as primary new talking points.\n"
+        "  - Use repository delta intelligence to classify prior issues as RESOLVED, PARTIALLY IMPLEMENTED, or STILL OPEN.\n"
+        "  - If repo changes show an issue is already implemented, do not reframe it as an untouched problem.\n"
+        "  - Prefer talking points that validate implementation quality, edge cases, regressions, and remaining gaps after recent code changes.\n"
         "  - Keep each talking point under 170 characters and contestable.\n"
         "  - Keep 8-14 talking points total.\n"
         "  - Description must be dense, long-form continuation (roughly 1200+ chars), not a short summary.\n"
@@ -152,6 +155,21 @@ class TopicRefineWorker(QThread):
         cx_unresolved = cx.get("unresolved", []) if isinstance(cx.get("unresolved", []), list) else []
         cx_signals = cx.get("transcript_signals", []) if isinstance(cx.get("transcript_signals", []), list) else []
         cx_trend = cx.get("scoring_trend", []) if isinstance(cx.get("scoring_trend", []), list) else []
+        repo_intel = cx.get("repo_intelligence", {}) if isinstance(cx.get("repo_intelligence", {}), dict) else {}
+
+        repo_enabled = bool(repo_intel.get("enabled", False))
+        repo_path = str(repo_intel.get("repo_path", "") or "").strip()
+        baseline_snap = str(repo_intel.get("baseline_generated_at", "") or repo_intel.get("baseline_snapshot_generated_at", "") or "").strip()
+        current_snap = str(repo_intel.get("current_generated_at", "") or "").strip()
+        repo_msg = str(repo_intel.get("message", "") or "").strip()
+        repo_counts = repo_intel.get("change_counts", {}) if isinstance(repo_intel.get("change_counts", {}), dict) else {}
+        repo_added = repo_intel.get("added", []) if isinstance(repo_intel.get("added", []), list) else []
+        repo_modified = repo_intel.get("modified", []) if isinstance(repo_intel.get("modified", []), list) else []
+        repo_deleted = repo_intel.get("deleted", []) if isinstance(repo_intel.get("deleted", []), list) else []
+        repo_modules = repo_intel.get("module_change_summaries", []) if isinstance(repo_intel.get("module_change_summaries", []), list) else []
+        repo_ast = repo_intel.get("ast_changes", []) if isinstance(repo_intel.get("ast_changes", []), list) else []
+        repo_nav = repo_intel.get("navigation_map", {}) if isinstance(repo_intel.get("navigation_map", {}), dict) else {}
+        repo_nav_files = repo_nav.get("files", []) if isinstance(repo_nav.get("files", []), list) else []
 
         def _fmt(items: list, max_items: int = 12) -> str:
             out: list[str] = []
@@ -160,6 +178,63 @@ class TopicRefineWorker(QThread):
                 if s:
                     out.append(f"  - {s[:260]}")
             return "\n".join(out) if out else "  (none)"
+
+        def _fmt_repo_ast(items: list, max_items: int = 14) -> str:
+            out: list[str] = []
+            for raw in items[:max_items]:
+                if not isinstance(raw, dict):
+                    continue
+                path = str(raw.get("path", "") or "").strip()
+                add = raw.get("added", []) if isinstance(raw.get("added", []), list) else []
+                rem = raw.get("removed", []) if isinstance(raw.get("removed", []), list) else []
+                parts: list[str] = []
+                if add:
+                    parts.append("+ " + ", ".join(str(x) for x in add[:4]))
+                if rem:
+                    parts.append("- " + ", ".join(str(x) for x in rem[:4]))
+                detail = " | ".join(parts) if parts else "symbol change"
+                if path:
+                    out.append(f"  - {path}: {detail[:240]}")
+            return "\n".join(out) if out else "  (none)"
+
+        def _fmt_repo_nav(items: list, max_items: int = 20) -> str:
+            out: list[str] = []
+            for raw in items[:max_items]:
+                if not isinstance(raw, dict):
+                    continue
+                path = str(raw.get("path", "") or "").strip()
+                if not path:
+                    continue
+                tags = raw.get("tags", []) if isinstance(raw.get("tags", []), list) else []
+                line_count = int(raw.get("line_count", 0) or 0)
+                tag_txt = ",".join(str(t) for t in tags[:4])
+                suffix = f" lines={line_count}" if line_count > 0 else ""
+                if tag_txt:
+                    suffix += f" tags={tag_txt}"
+                out.append(f"  - {path}{suffix}")
+            return "\n".join(out) if out else "  (none)"
+
+        repo_block = (
+            "REPOSITORY CHANGE INTELLIGENCE:\n"
+            f"  enabled={repo_enabled}\n"
+            f"  repo_path={repo_path or '(none)'}\n"
+            f"  baseline_snapshot={baseline_snap or '(none)'}\n"
+            f"  current_snapshot={current_snap or '(none)'}\n"
+            f"  change_counts={json.dumps(repo_counts, ensure_ascii=False)[:500]}\n"
+            f"  summary={repo_msg or '(none)'}\n"
+            "  Added files:\n"
+            f"{_fmt(repo_added, max_items=20)}\n"
+            "  Modified files:\n"
+            f"{_fmt(repo_modified, max_items=24)}\n"
+            "  Deleted files:\n"
+            f"{_fmt(repo_deleted, max_items=20)}\n"
+            "  Module change summaries:\n"
+            f"{_fmt(repo_modules, max_items=30)}\n"
+            "  AST-level symbol deltas:\n"
+            f"{_fmt_repo_ast(repo_ast, max_items=20)}\n"
+            "  Repository navigation map (for iterative file investigation):\n"
+            f"{_fmt_repo_nav(repo_nav_files, max_items=30)}\n"
+        )
 
         return (
             f"TOPIC TITLE: {self._title}\n\n"
@@ -192,6 +267,7 @@ class TopicRefineWorker(QThread):
             f"{_fmt(cx_signals, max_items=24)}\n\n"
             "SCORING TREND ACROSS THREAD:\n"
             f"{_fmt(cx_trend, max_items=12)}\n\n"
+            f"{repo_block}\n"
             "CURRENT SESSION BRIEF METADATA:\n"
             f"  mode={prior_mode or 'unknown'}\n"
             f"  repo_path={prior_repo or '(none)'}\n"
@@ -213,7 +289,8 @@ class TopicRefineWorker(QThread):
             "GRAPH NODE DISTRIBUTION:\n"
             f"{graph_count_list}\n\n"
             "Rewrite the description and talking points for the NEXT session so the debate evolves organically "
-            "instead of repeating prior framing. Preserve continuity but raise depth and contestability."
+            "instead of repeating prior framing. Preserve continuity but raise depth and contestability. "
+            "Use repository deltas to remove or downgrade already-implemented issues and promote unresolved or partially implemented threads."
         )
 
     def _call_ollama(self, user_msg: str) -> dict[str, Any]:
