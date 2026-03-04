@@ -4,13 +4,15 @@ Layout
 ------
   Top section  : scrollable live score feed (turn rows + arbiter interventions)
   Bottom strip : winner banner + AI-written summary (appears after debate ends)
-  Button row   : Copy Results | Open Session Folder
+    Button row   : Copy Conversation | Open Session Folder
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from html import escape
+from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QTextOption
@@ -138,7 +140,7 @@ class ScoringPanel(QWidget):
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
-        self._copy_btn = QPushButton("📋 Copy Results")
+        self._copy_btn = QPushButton("📋 Copy Conversation")
         self._copy_btn.setStyleSheet(
             "QPushButton { background: #1a2840; color: #80cbc4; border-radius: 6px;"
             " padding: 5px 12px; border: 1px solid #2a3a55; }"
@@ -283,7 +285,49 @@ class ScoringPanel(QWidget):
 
     def _copy_results(self) -> None:
         from PyQt6.QtWidgets import QApplication
-        QApplication.clipboard().setText(self._result_text)
+        text = self._build_conversation_copy_text() or self._result_text
+        QApplication.clipboard().setText(text)
+
+    def _build_conversation_copy_text(self) -> str:
+        if not self._session_path:
+            return ""
+
+        transcript_path = Path(self._session_path) / "transcript.jsonl"
+        if not transcript_path.exists():
+            return ""
+
+        lines: list[str] = []
+        for raw in transcript_path.read_text(encoding="utf-8").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except Exception:
+                continue
+
+            etype = event.get("event_type", "")
+            payload = event.get("payload", {}) or {}
+
+            if etype == "public_message":
+                turn = payload.get("turn", "?")
+                agent = str(payload.get("agent", "?")).strip() or "?"
+                message = str(payload.get("message", "")).strip()
+                talking_point = str(payload.get("talking_point", "")).strip()
+                if not message:
+                    continue
+                header = f"[T{turn}] {agent}"
+                if talking_point:
+                    header += f" [{talking_point}]"
+                lines.append(f"{header}:\n{message}")
+
+            elif etype == "arbiter":
+                turn = payload.get("turn", "?")
+                message = str(payload.get("message", "")).strip()
+                if message:
+                    lines.append(f"[T{turn}] Arbiter:\n{message}")
+
+        return "\n\n".join(lines)
 
     def _open_folder(self) -> None:
         if self._session_path and os.path.isdir(self._session_path):

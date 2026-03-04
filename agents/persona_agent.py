@@ -242,6 +242,10 @@ class PersonaAgent(BaseAgent):
                 ("FALSE:", "falsehood"),
                 ("VERIFIED:", "verified_claim"),
                 ("HYPOTHETICAL:", "hypothetical"),
+                ("DIAGRAM:", "framing"),
+                ("UI-PLAN:", "framing"),
+                ("BLUEPRINT:", "framing"),
+                ("GRAPH-SCHEMA:", "framing"),
             ):
                 if prefix in stripped:
                     idx = stripped.index(prefix)

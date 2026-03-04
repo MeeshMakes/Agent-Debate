@@ -60,9 +60,62 @@ _STOPWORDS = frozenset({
     "then", "even", "still", "itself", "itself",
 })
 
+_ARTIFACT_HEADER_RE = re.compile(
+    r"^\s*(?:DIAGRAM|ARCH-DIAGRAM|ASCII-DIAGRAM|DIAGRAM-DELTA|"
+    r"GRAPH-SCHEMA|GRAPH SCHEMA|GRAPH-DELTA|UI-PLAN|UI-PLAN-DELTA)\s*:",
+    re.IGNORECASE,
+)
+_SECTION_HEADER_RE = re.compile(r"^\s*[A-Z][A-Z\- ]{2,}\s*:\s*$")
+
+
+def _strip_structured_artifacts(text: str) -> str:
+    lines = text.splitlines()
+    kept: list[str] = []
+    in_artifact = False
+    for line in lines:
+        stripped = line.strip()
+        if _ARTIFACT_HEADER_RE.match(stripped):
+            in_artifact = True
+            continue
+
+        if in_artifact:
+            if not stripped:
+                in_artifact = False
+                continue
+            if _SECTION_HEADER_RE.match(stripped):
+                in_artifact = False
+                continue
+            if re.match(r"^(?:CLAIM-\d+|VERIFIED:|HYPOTHETICAL:|CONCLUDE:|QUESTION:)\b", stripped, re.IGNORECASE):
+                in_artifact = False
+                kept.append(line)
+                continue
+            if not _is_artifact_content_line(stripped):
+                in_artifact = False
+                kept.append(line)
+                continue
+            continue
+
+        kept.append(line)
+
+    return "\n".join(kept)
+
+
+def _is_artifact_content_line(line: str) -> bool:
+    return bool(
+        "->" in line
+        or "relation=" in line.lower()
+        or "weight=" in line.lower()
+        or "confidence=" in line.lower()
+        or line.startswith(("-", "*", "•"))
+        or re.match(r"^\d+\.\s+", line)
+        or (line.startswith("[") and "]" in line)
+        or (line.startswith("(") and ")" in line)
+    )
+
 
 def _tokenize(text: str) -> set[str]:
     """Lower-cased content tokens, stopwords removed."""
+    text = _strip_structured_artifacts(text)
     return {
         t.lower() for t in _TOKEN_RE.findall(text)
         if t.lower() not in _STOPWORDS
@@ -131,14 +184,25 @@ class DebateQuality:
         if not msg_tokens:
             return QualitySnapshot(0.0, 0.0, 0.0)
 
-        # Combine recent context for relevance / novelty
+        # Combine recent context for relevance and compute per-turn similarity windows
+        recent_window = recent_messages[-6:]
         recent_tokens: set[str] = set()
-        for item in recent_messages[-6:]:
+        for item in recent_window:
             recent_tokens.update(_tokenize(item))
 
-        # Novelty: fraction of current-message tokens NOT in recent context
+        # Novelty (token coverage): fraction of current-message tokens NOT in recent context
         shared = len(msg_tokens & recent_tokens)
-        novelty = max(0.0, 1.0 - (shared / max(len(msg_tokens), 1)))
+        token_novelty = max(0.0, 1.0 - (shared / max(len(msg_tokens), 1)))
+
+        # Novelty (phrase overlap): 1 - max Jaccard overlap against recent messages
+        if recent_window:
+            max_overlap = max((jaccard(message, prev) for prev in recent_window), default=0.0)
+            overlap_novelty = max(0.0, 1.0 - max_overlap)
+        else:
+            overlap_novelty = 1.0
+
+        # Blend both to prevent monotonic collapse when recent token union grows large
+        novelty = (0.55 * overlap_novelty) + (0.45 * token_novelty)
 
         # Relevance: how much the message shares with recent context
         # Capped at 1.0; floor of 0.4 since being on-topic is cheap

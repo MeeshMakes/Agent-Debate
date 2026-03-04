@@ -4,7 +4,7 @@ Replaces the dropdown. Opens as a large pop-out:
   Left column  — clickable topic cards (title + 2-line teaser)
   Right panel  — full description + talking points for selected topic
                  Editable when "Custom Debate" is selected; read-only for presets
-  Bottom row   — file ingestion toggle + "Start this topic" confirm
+    Bottom row   — file ingestion toggle + "Go to session" confirm
 
 Emits: topic_confirmed(title: str, full_context: str, file_paths: list[str])
   full_context is the complete brief fed to agents.
@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import json
 import hashlib
+from html import escape
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QUrl, pyqtSignal
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont
+from PyQt6.QtCore import Qt, QThread, QUrl, QTimer, pyqtSignal
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QKeyEvent
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -32,6 +34,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -46,6 +49,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QDesktopServices
 
 from config.starter_topics import STARTER_TOPICS, StarterTopic
+from agents.topic_refine_worker import TopicRefineWorker
 from core.custom_debates import CustomDebate, get_custom_debate_store
 from core.repo_watchdog import RepoWatchdog
 from core.session_manager import get_session_manager, SessionMeta
@@ -64,6 +68,11 @@ def _tp_key(topic_title: str, tp_text: str) -> str:
     """Return a stable 12-char hex key for a topic+talking-point pair."""
     raw = (topic_title + tp_text[:60]).encode()
     return hashlib.sha1(raw).hexdigest()[:12]
+
+
+def _custom_debate_tp_key(debate_id: str) -> str:
+    """Return a stable talking-point key for a persisted custom debate widget."""
+    return f"custom_{debate_id[:12]}"
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -157,12 +166,14 @@ class _RepoSchemaWorker(QThread):
         *,
         repo_path: str,
         repo_brief: str,
+        user_intent: str = "",
         model: str = "qwen3:30b",
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._repo_path = repo_path
         self._repo_brief = repo_brief
+        self._user_intent = user_intent
         self._model = model
 
     def run(self) -> None:
@@ -214,7 +225,13 @@ class _RepoSchemaWorker(QThread):
                 "DO NOT invent method names, file paths, or constants. Only use names you can "
                 "actually see in the provided excerpts. If a section has nothing concrete from the "
                 "code, mark it as 'Investigate: <file> — no excerpt available yet'.\n\n"
+                "CONTEXT PRESERVATION (MANDATORY):\n"
+                "- The user's intent and constraints are authoritative and must be preserved.\n"
+                "- Reframe intelligently, but do not drop or replace the user's core concerns.\n"
+                "- Description must include a section titled 'Preserved User Intent' with bullets.\n"
+                "- At least 3 talking_points must directly reflect those preserved concerns while staying contestable.\n\n"
                 "No markdown outside the JSON block.\n\n"
+                f"User Intent and Existing Draft (must preserve):\n{self._user_intent[:9000]}\n\n"
                 f"Repository Path:\n{self._repo_path}\n\n"
                 f"Repository Snapshot Brief (includes source code excerpts):\n{self._repo_brief[:22000]}"
             )
@@ -694,7 +711,8 @@ class _SessionHistoryPanel(QWidget):
     """
 
     session_clicked  = pyqtSignal(str)   # session_id
-    start_requested  = pyqtSignal()      # user hit Start / Continue
+    start_requested  = pyqtSignal()      # user navigates back to session view
+    refine_requested = pyqtSignal()      # manually update topic from past sessions
     thread_reset     = pyqtSignal()      # user successfully reset thread
     data_cleared     = pyqtSignal()      # user successfully cleared all data
 
@@ -702,6 +720,7 @@ class _SessionHistoryPanel(QWidget):
         super().__init__(parent)
         self._base_tp_key: str = ""
         self._session_count: int = 0
+        self._selected_generation: int | None = None
         self.setStyleSheet("background: #060e18;")
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 10, 10, 10)
@@ -717,13 +736,33 @@ class _SessionHistoryPanel(QWidget):
         self._thread_lbl.setStyleSheet("color: #2a6070; font-size: 9px; background: transparent;")
         lay.addWidget(self._thread_lbl)
 
+        thread_row = QHBoxLayout()
+        thread_row.setSpacing(6)
+        self._thread_sel_lbl = QLabel("Thread:")
+        self._thread_sel_lbl.setStyleSheet("color: #78909c; font-size: 10px; background: transparent;")
+        self._thread_combo = QComboBox()
+        self._thread_combo.setEnabled(False)
+        self._thread_combo.setMinimumWidth(170)
+        self._thread_combo.setStyleSheet(
+            "QComboBox { background: #0a1520; color: #dce8f5; border: 1px solid #2a3a55;"
+            " border-radius: 5px; padding: 3px 8px; font-size: 10px; }"
+            "QComboBox:disabled { color: #546e7a; border-color: #1a2030; }"
+            "QComboBox QAbstractItemView { background: #0d1520; color: #dce8f5;"
+            " border: 1px solid #2a3a55; selection-background-color: #1e3a5f; }"
+        )
+        self._thread_combo.currentIndexChanged.connect(self._on_thread_changed)
+        thread_row.addWidget(self._thread_sel_lbl)
+        thread_row.addWidget(self._thread_combo)
+        thread_row.addStretch()
+        lay.addLayout(thread_row)
+
         self._sub = QLabel("No sessions yet for this talking point.")
         self._sub.setStyleSheet("color: #546e7a; font-size: 10px; background: transparent;")
         self._sub.setWordWrap(True)
         lay.addWidget(self._sub)
 
         # ── Start / Continue button ──────────────────────────────────────────
-        self._start_btn = QPushButton("▶  Start Session 1")
+        self._start_btn = QPushButton("▶  Go to Session 1")
         self._start_btn.setStyleSheet(
             "QPushButton { background: #00695c; color: #fff; font-weight: 700;"
             " border-radius: 8px; padding: 8px 18px; font-size: 12px; border: 1px solid #00897b; }"
@@ -731,6 +770,21 @@ class _SessionHistoryPanel(QWidget):
         )
         self._start_btn.clicked.connect(self.start_requested)
         lay.addWidget(self._start_btn)
+
+        self._refine_btn = QPushButton("🧠  Update from Past Sessions")
+        self._refine_btn.setToolTip(
+            "Manually regenerate this debate's description and talking points\n"
+            "using all past sessions in the selected thread."
+        )
+        self._refine_btn.setEnabled(False)
+        self._refine_btn.setStyleSheet(
+            "QPushButton { background: #12304a; color: #b2ebf2; font-weight: 700;"
+            " border-radius: 7px; padding: 6px 12px; font-size: 10px; border: 1px solid #1e4a70; }"
+            "QPushButton:hover { background: #1a3a60; color: #ffffff; }"
+            "QPushButton:disabled { color: #546e7a; border-color: #1a2030; background: #0a1520; }"
+        )
+        self._refine_btn.clicked.connect(self.refine_requested)
+        lay.addWidget(self._refine_btn)
 
         # ── Thread management row ────────────────────────────────────────────
         mgmt_row = QHBoxLayout()
@@ -791,10 +845,66 @@ class _SessionHistoryPanel(QWidget):
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    def load_sessions(self, base_tp_key: str) -> None:
-        """Load sessions for the current generation of base_tp_key."""
+    def load_sessions(self, base_tp_key: str, selected_generation: int | None = None) -> None:
+        """Load sessions for base_tp_key and allow switching between all thread generations."""
         self._base_tp_key = base_tp_key
 
+        sm = get_session_manager()
+
+        # Reset thread selector when no talking-point key is active.
+        if not base_tp_key:
+            self._thread_combo.blockSignals(True)
+            self._thread_combo.clear()
+            self._thread_combo.blockSignals(False)
+            self._thread_combo.setEnabled(False)
+            self._selected_generation = None
+
+            while self._card_col.count() > 1:
+                item = self._card_col.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+
+            self._session_count = 0
+            self._thread_lbl.setText("")
+            self._sub.setText("No sessions yet in this thread.")
+            self._start_btn.setText("▶  Go to Session 1")
+            self._refine_btn.setEnabled(False)
+            self._reset_btn.setEnabled(False)
+            self._clear_btn.setEnabled(False)
+            return
+
+        latest_gen = sm.get_tp_generation(base_tp_key)
+
+        # Populate thread selector (Thread 1 .. Thread N)
+        self._thread_combo.blockSignals(True)
+        self._thread_combo.clear()
+        for g in range(latest_gen + 1):
+            eff = base_tp_key if g == 0 else f"{base_tp_key}_g{g}"
+            count = len(sm.list_sessions_for_tp(eff))
+            suffix = "  (Current)" if g == latest_gen else ""
+            self._thread_combo.addItem(f"Thread {g + 1} · {count} sessions{suffix}", g)
+        self._thread_combo.blockSignals(False)
+        self._thread_combo.setEnabled(self._thread_combo.count() > 0)
+
+        if selected_generation is not None:
+            target_gen = max(0, min(latest_gen, int(selected_generation)))
+        elif self._selected_generation is not None and self._selected_generation <= latest_gen:
+            target_gen = self._selected_generation
+        else:
+            target_gen = latest_gen
+
+        idx = self._thread_combo.findData(target_gen)
+        if idx < 0 and self._thread_combo.count() > 0:
+            idx = self._thread_combo.count() - 1
+        if idx >= 0:
+            self._thread_combo.blockSignals(True)
+            self._thread_combo.setCurrentIndex(idx)
+            self._thread_combo.blockSignals(False)
+        self._selected_generation = target_gen
+
+        self._render_selected_thread_sessions()
+
+    def _render_selected_thread_sessions(self) -> None:
         # Remove old cards (all items except the stretch at end)
         while self._card_col.count() > 1:
             item = self._card_col.takeAt(0)
@@ -802,25 +912,37 @@ class _SessionHistoryPanel(QWidget):
                 item.widget().deleteLater()
 
         sm = get_session_manager()
-        eff_key = sm.effective_tp_key(base_tp_key) if base_tp_key else ""
-        sessions = sm.list_sessions_for_tp(eff_key) if eff_key else []
+        base_tp_key = self._base_tp_key
+        if not base_tp_key:
+            self._session_count = 0
+            self._thread_lbl.setText("")
+            self._sub.setText("No sessions yet in this thread.")
+            self._start_btn.setText("▶  Go to Session 1")
+            self._refine_btn.setEnabled(False)
+            self._reset_btn.setEnabled(False)
+            self._clear_btn.setEnabled(False)
+            return
+
+        latest_gen = sm.get_tp_generation(base_tp_key)
+        selected_gen = self._selected_generation if self._selected_generation is not None else latest_gen
+        eff_key = base_tp_key if selected_gen == 0 else f"{base_tp_key}_g{selected_gen}"
+        sessions = sm.list_sessions_for_tp(eff_key)
         self._session_count = len(sessions)
 
-        # Thread / generation badge
-        gen = sm.get_tp_generation(base_tp_key) if base_tp_key else 0
-        if gen > 0:
-            self._thread_lbl.setText(f"Thread {gen + 1}  ·  previous threads archived")
+        if selected_gen == latest_gen:
+            self._thread_lbl.setText(f"Viewing current thread (Thread {selected_gen + 1})")
         else:
-            self._thread_lbl.setText("")
+            self._thread_lbl.setText(
+                f"Viewing archived thread {selected_gen + 1}  ·  current is Thread {latest_gen + 1}"
+            )
 
         if sessions:
             self._sub.setText(
-                f"{self._session_count} session(s) in this thread — click to view transcript."
+                f"{self._session_count} session(s) in Thread {selected_gen + 1} — click to view transcript."
             )
         else:
-            self._sub.setText("No sessions yet in this thread.")
+            self._sub.setText(f"No sessions yet in Thread {selected_gen + 1}.")
 
-        # Number oldest=1 … newest=N
         for idx, meta in enumerate(reversed(sessions)):
             card = _SessionCard(meta, idx + 1)
             card.clicked.connect(self.session_clicked)
@@ -828,14 +950,43 @@ class _SessionHistoryPanel(QWidget):
 
         next_num = self._session_count + 1
         self._start_btn.setText(
-            f"▶  Start Session 1" if self._session_count == 0
-            else f"▶  Continue — Start Session {next_num}"
+            f"▶  Go to Session 1" if self._session_count == 0
+            else f"▶  Go to Session {next_num}"
         )
 
-        # Enable management buttons only when there is a real tp_key
         has_key = bool(base_tp_key)
-        self._reset_btn.setEnabled(has_key and self._session_count > 0)
+        self._refine_btn.setEnabled(has_key and self._session_count > 0)
+        self._reset_btn.setEnabled(has_key and selected_gen == latest_gen and self._session_count > 0)
         self._clear_btn.setEnabled(has_key)
+
+    def set_refine_busy(self, busy: bool) -> None:
+        if busy:
+            self._refine_btn.setEnabled(False)
+            self._refine_btn.setText("🧠  Updating from Sessions…")
+            return
+        self._refine_btn.setText("🧠  Update from Past Sessions")
+        self._refine_btn.setEnabled(bool(self._base_tp_key) and self._session_count > 0)
+
+    def _on_thread_changed(self, _index: int) -> None:
+        if not self._base_tp_key:
+            return
+        data = self._thread_combo.currentData()
+        if data is None:
+            return
+        try:
+            self._selected_generation = int(data)
+        except Exception:
+            return
+        self._render_selected_thread_sessions()
+
+    def selected_effective_tp_key(self) -> str:
+        if not self._base_tp_key:
+            return ""
+        sm = get_session_manager()
+        latest_gen = sm.get_tp_generation(self._base_tp_key)
+        selected_gen = self._selected_generation if self._selected_generation is not None else latest_gen
+        selected_gen = max(0, min(latest_gen, selected_gen))
+        return self._base_tp_key if selected_gen == 0 else f"{self._base_tp_key}_g{selected_gen}"
 
     def next_session_number(self) -> int:
         return self._session_count + 1
@@ -860,7 +1011,7 @@ class _SessionHistoryPanel(QWidget):
             return
         sm = get_session_manager()
         sm.reset_tp_thread(self._base_tp_key)
-        self.load_sessions(self._base_tp_key)
+        self.load_sessions(self._base_tp_key, selected_generation=sm.get_tp_generation(self._base_tp_key))
         self.thread_reset.emit()
 
     def _on_clear_data(self) -> None:
@@ -886,7 +1037,7 @@ class _SessionHistoryPanel(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
         sm.clear_tp_data(self._base_tp_key)
-        self.load_sessions(self._base_tp_key)
+        self.load_sessions(self._base_tp_key, selected_generation=0)
         self.data_cleared.emit()
 
 
@@ -992,22 +1143,51 @@ class _TranscriptViewerPanel(QWidget):
             etype = evt.get("event_type", "")
             payload = evt.get("payload", {})
 
-            if etype == "turn":
-                speaker = payload.get("speaker", "")
-                text = payload.get("text", "")
-                turn_n = payload.get("turn_number", "")
-                if speaker == left_name:
-                    color = _AGENT_COLORS.get(left_name, _DEFAULT_L)
+            if etype in {"turn", "public_message"}:
+                if etype == "turn":
+                    speaker = str(payload.get("speaker", "")).strip()
+                    text = str(payload.get("text", "")).strip()
+                    turn_n = payload.get("turn_number", "")
+                    talking_point = ""
                 else:
+                    speaker = str(payload.get("agent", "")).strip()
+                    text = str(payload.get("message", "")).strip()
+                    turn_n = payload.get("turn", "")
+                    talking_point = str(payload.get("talking_point", "")).strip()
+
+                speaker_l = speaker.lower()
+                if speaker_l == left_name.lower():
+                    color = _AGENT_COLORS.get(left_name, _DEFAULT_L)
+                elif speaker_l == right_name.lower():
                     color = _AGENT_COLORS.get(right_name, _DEFAULT_R)
+                else:
+                    color = _AGENT_COLORS.get(speaker, _DEFAULT_L)
+
+                tp_line = (
+                    f"<div style='margin-top:2px; color:#607d8b; font-size:9px;'>"
+                    f"↳ {escape(talking_point)}</div>"
+                    if talking_point else ""
+                )
                 lines.append(
                     f"<div style='margin-bottom:10px;'>"
                     f"<span style='color:{color}; font-weight:700; font-size:10px;'>"
-                    f"  {speaker}  </span>"
+                    f"  {escape(speaker)}  </span>"
                     f"<span style='color:#3a5060; font-size:9px;'>turn {turn_n}</span>"
-                    f"<div style='margin-top:3px; color:#b0bec5;'>{text}</div>"
+                    f"<div style='margin-top:3px; color:#b0bec5;'>{escape(text)}</div>"
+                    f"{tp_line}"
                     f"</div>"
                 )
+
+            elif etype == "private_thought":
+                speaker = str(payload.get("agent", "Agent")).strip()
+                thought = str(payload.get("thought", "")).strip()
+                turn_n = payload.get("turn", "")
+                if thought:
+                    lines.append(
+                        f"<div style='background:#0b121b; border-left:3px solid #455a64;"
+                        f" padding:6px 10px; margin:8px 0; color:#90a4ae; font-size:10px;'>"
+                        f"[{escape(speaker)} private · T{turn_n}] {escape(thought)}</div>"
+                    )
 
             elif etype == "resolution":
                 truths = payload.get("truths", [])
@@ -1052,8 +1232,25 @@ class _AssistantChatPanel(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._worker = None
+        self._generation_context: str = ""
+        self._assistant_cloud_enabled: bool = False
         self.setStyleSheet(f"background: {_PALETTE['panel']};")
         self._build()
+
+    def set_generation_context(self, context: str) -> None:
+        self._generation_context = (context or "").strip()
+
+    class _InputBox(QTextEdit):
+        send_requested = pyqtSignal()
+
+        def keyPressEvent(self, event: QKeyEvent) -> None:  # type: ignore[override]
+            is_enter = event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+            shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if is_enter and not shift:
+                event.accept()
+                self.send_requested.emit()
+                return
+            super().keyPressEvent(event)
 
     def _build(self) -> None:
         lay = QVBoxLayout(self)
@@ -1070,6 +1267,53 @@ class _AssistantChatPanel(QWidget):
         sub.setStyleSheet(f"color: {_PALETTE['dim']}; background: transparent;")
         lay.addWidget(sub)
 
+        # Model selector row
+        model_row = QHBoxLayout()
+        model_row.setSpacing(4)
+        model_lbl = QLabel("Model:")
+        model_lbl.setStyleSheet(f"color: {_PALETTE['dim']}; font-size: 10px; background: transparent;")
+        model_row.addWidget(model_lbl)
+
+        self._model_combo = QComboBox()
+        self._model_combo.setEditable(False)
+        self._model_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._model_combo.setStyleSheet(
+            f"QComboBox {{ background: {_PALETTE['bg']}; color: {_PALETTE['text']};"
+            f" border: 1px solid {_PALETTE['border']}; border-radius: 4px;"
+            f" padding: 2px 6px; font-size: 10px; min-width: 120px; }}"
+            f"QComboBox::drop-down {{ border: none; }}"
+            f"QComboBox QAbstractItemView {{ background: {_PALETTE['bg']};"
+            f" color: {_PALETTE['text']}; selection-background-color: {_PALETTE['accent']}; }}"
+        )
+        self._populate_model_combo()
+        model_row.addWidget(self._model_combo, stretch=1)
+
+        self._cloud_toggle_btn = QPushButton("☁ Cloud OFF")
+        self._cloud_toggle_btn.setCheckable(True)
+        self._cloud_toggle_btn.setChecked(False)
+        self._cloud_toggle_btn.setToolTip("Toggle cloud-tagged models in this assistant dropdown")
+        self._cloud_toggle_btn.setStyleSheet(
+            f"QPushButton {{ background: {_PALETTE['bg']}; color: {_PALETTE['dim']};"
+            f" border: 1px solid {_PALETTE['border']}; border-radius: 4px;"
+            f" padding: 2px 8px; font-size: 10px; font-weight: 700; }}"
+            f"QPushButton:hover {{ color: {_PALETTE['text']}; border-color: {_PALETTE['accent']}; }}"
+            f"QPushButton:checked {{ color: #e1bee7; border-color: #ce93d8; background: #3a2455; }}"
+        )
+        self._cloud_toggle_btn.toggled.connect(self._on_cloud_toggle)
+        model_row.addWidget(self._cloud_toggle_btn)
+
+        refresh_btn = QPushButton("⟳")
+        refresh_btn.setFixedSize(22, 22)
+        refresh_btn.setToolTip("Refresh Ollama model list")
+        refresh_btn.setStyleSheet(
+            f"QPushButton {{ background: {_PALETTE['bg']}; color: {_PALETTE['dim']};"
+            f" border: 1px solid {_PALETTE['border']}; border-radius: 4px; font-size: 11px; }}"
+            f"QPushButton:hover {{ color: {_PALETTE['text']}; border-color: {_PALETTE['accent']}; }}"
+        )
+        refresh_btn.clicked.connect(self._populate_model_combo)
+        model_row.addWidget(refresh_btn)
+        lay.addLayout(model_row)
+
         # Chat history
         self._chat = QTextBrowser()
         self._chat.setOpenExternalLinks(False)
@@ -1083,17 +1327,21 @@ class _AssistantChatPanel(QWidget):
         # Input row
         input_row = QHBoxLayout()
         input_row.setSpacing(6)
-        self._input = QLineEdit()
+        self._input = self._InputBox()
         self._input.setPlaceholderText(
             "e.g. Create a debate about submarine pressure physics..."
         )
+        self._input.setAcceptRichText(False)
+        self._input.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self._input.setStyleSheet(
-            f"QLineEdit {{ background: {_PALETTE['bg']}; color: {_PALETTE['text']};"
+            f"QTextEdit {{ background: {_PALETTE['bg']}; color: {_PALETTE['text']};"
             f" border: 1px solid {_PALETTE['border']}; border-radius: 6px;"
             f" padding: 8px 12px; font-size: 11px; }}"
-            f"QLineEdit:focus {{ border-color: {_PALETTE['accent']}; }}"
+            f"QTextEdit:focus {{ border-color: {_PALETTE['accent']}; }}"
         )
-        self._input.returnPressed.connect(self._on_send)
+        self._input.send_requested.connect(self._on_send)
+        self._input.textChanged.connect(self._resize_input_for_text)
+        self._resize_input_for_text()
         input_row.addWidget(self._input, stretch=1)
 
         self._send_btn = QPushButton("Send")
@@ -1136,14 +1384,106 @@ class _AssistantChatPanel(QWidget):
             f'<div style="color:{_PALETTE["text"]};margin-bottom:6px;">{text}</div>'
         )
 
+    def _populate_model_combo(self) -> None:
+        """Fetch Ollama models and populate the combo; cloud models optional via toggle."""
+        import urllib.request as _ur
+        import json as _json
+
+        previous = self._model_combo.currentText().strip() if self._model_combo.count() > 0 else ""
+
+        # Fall back to pref default
+        try:
+            from config.model_prefs import load_model_prefs
+            pref_model = load_model_prefs().get("right_model", "qwen3:30b") or "qwen3:30b"
+        except Exception:
+            pref_model = "qwen3:30b"
+
+        # Try to fetch live list from Ollama
+        models: list[str] = []
+        try:
+            with _ur.urlopen("http://localhost:11434/api/tags", timeout=4) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            models = [m["name"] for m in data.get("models", [])]
+        except Exception:
+            pass
+
+        local_models = sorted([m for m in models if not self._is_cloud_model_name(m)])
+        cloud_models = sorted([m for m in models if self._is_cloud_model_name(m)])
+
+        # Include cloud-tagged models only when toggle is ON
+        pool = list(local_models)
+        if self._assistant_cloud_enabled:
+            pool.extend(cloud_models)
+
+        # Ensure fallback selection exists even if Ollama is unavailable
+        if not pool:
+            if self._assistant_cloud_enabled or not self._is_cloud_model_name(pref_model):
+                pool = [pref_model]
+            elif local_models:
+                pool = local_models
+            else:
+                pool = ["qwen3:30b"]
+
+        # Ensure pref model is selectable when valid for current toggle mode
+        if pref_model not in pool:
+            if self._assistant_cloud_enabled or not self._is_cloud_model_name(pref_model):
+                pool.insert(0, pref_model)
+
+        # Deduplicate while preserving order
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for m in pool:
+            key = m.strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(m)
+
+        self._model_combo.blockSignals(True)
+        self._model_combo.clear()
+        self._model_combo.addItems(deduped)
+
+        # Restore previous selection or default to pref
+        target = previous if (previous and previous in deduped) else pref_model
+        idx = self._model_combo.findText(target)
+        if idx >= 0:
+            self._model_combo.setCurrentIndex(idx)
+        elif deduped:
+            self._model_combo.setCurrentIndex(0)
+        self._model_combo.blockSignals(False)
+
+    @staticmethod
+    def _is_cloud_model_name(name: str) -> bool:
+        lower = (name or "").lower().strip()
+        if ":" in lower:
+            tag = lower.split(":", 1)[1]
+            if "cloud" in tag:
+                return True
+        return lower.endswith("-cloud")
+
+    def _on_cloud_toggle(self, checked: bool) -> None:
+        self._assistant_cloud_enabled = bool(checked)
+        self._cloud_toggle_btn.setText("☁ Cloud ON" if self._assistant_cloud_enabled else "☁ Cloud OFF")
+        self._populate_model_combo()
+
+    def _resize_input_for_text(self) -> None:
+        line_h = max(16, self._input.fontMetrics().lineSpacing())
+        min_h = line_h + 14
+        max_h = (line_h * 5) + 14
+        doc = self._input.document()
+        doc_h = int(doc.size().height()) + 8 if doc is not None else min_h
+        target_h = max(min_h, min(max_h, doc_h))
+        self._input.setFixedHeight(target_h)
+
     def _on_send(self) -> None:
-        text = self._input.text().strip()
+        text = self._input.toPlainText().strip()
         if not text:
             return
         if self._worker is not None and self._worker.isRunning():
             return
 
         self._input.clear()
+        self._resize_input_for_text()
         self._append_user(text)
         self._send_btn.setEnabled(False)
         self._status.setText("Generating...")
@@ -1166,12 +1506,8 @@ class _AssistantChatPanel(QWidget):
         except Exception:
             analytics_text = ""
 
-        # Model
-        try:
-            from config.model_prefs import load_model_prefs
-            model = load_model_prefs().get("right_model", "qwen3:30b") or "qwen3:30b"
-        except Exception:
-            model = "qwen3:30b"
+        # Model — use dropdown selection
+        model = self._model_combo.currentText().strip() or "qwen3:30b"
 
         from agents.topic_assistant_worker import TopicAssistantWorker
         self._worker = TopicAssistantWorker(
@@ -1180,6 +1516,7 @@ class _AssistantChatPanel(QWidget):
             existing_titles=existing,
             analytics_summary=analytics_text,
             segue_context="",
+            workspace_context=self._generation_context,
             origin="user",
             parent=self,
         )
@@ -1207,6 +1544,9 @@ class _AssistantChatPanel(QWidget):
         self._status.setText(f"✗ Failed")
         self._append_system(f"Sorry, I ran into an error: {error[:120]}")
 
+    def selected_model(self) -> str:
+        return self._model_combo.currentText().strip() if hasattr(self, "_model_combo") else ""
+
 
 class TopicPickerDialog(QDialog):
     """Debate Studio — full topic browser with assistant, autonomous learning,
@@ -1216,22 +1556,42 @@ class TopicPickerDialog(QDialog):
 
     def __init__(self, current_title: str = "", parent=None) -> None:
         super().__init__(parent)
+        self._initial_title = current_title.strip()
         session_root = get_session_manager().root
+        try:
+            get_session_manager().backfill_all_session_briefs()
+        except Exception:
+            pass
         self._custom_debate_store = get_custom_debate_store(session_root)
         self._custom_debates: list[CustomDebate] = []
         self._card_entries: list[dict] = []
         self._active_custom_id: str | None = None
         self.setWindowTitle("Debate Studio")
-        self.resize(1620, 860)
+        self.setWindowFlag(Qt.WindowType.WindowMinMaxButtonsHint, True)
+        self.setSizeGripEnabled(True)
+        self.resize(1280, 760)
+        self.setMinimumSize(1120, 600)
         self.setModal(True)
         self._queued_files: list[Path] = []
         self._selected_index: int = 0
         self._cards: list[_TopicCard] = []
         self._card_col: QVBoxLayout | None = None
         self._rewrite_worker: _RewriteWorker | None = None
+        self._manual_refine_worker: TopicRefineWorker | None = None
+        self._manual_refine_tp_key: str = ""
+        self._manual_refine_session_id: str = ""
         self._repo_schema_worker: _RepoSchemaWorker | None = None
         self._repo_schema_generated_once: bool = False
         self._repo_all_models: list[str] = []
+        self._seed_source_session_id: str = ""
+        self._skip_next_auto_seed_from_session: bool = False
+        self._session_autosave_lbl: QLabel | None = None
+        self._active_session_brief_id: str = ""
+        self._suspend_session_autosave: bool = False
+        self._session_autosave_timer = QTimer(self)
+        self._session_autosave_timer.setSingleShot(True)
+        self._session_autosave_timer.setInterval(650)
+        self._session_autosave_timer.timeout.connect(self._autosave_active_session_brief)
         # Per-talking-point key for session history
         self._current_tp_key: str = ""
         # References to new panels (set in _build_ui)
@@ -1250,12 +1610,62 @@ class TopicPickerDialog(QDialog):
         """Generation-aware key that will be written to the new session."""
         if not self._current_tp_key:
             return ""
+        if self._history_panel is not None:
+            selected = self._history_panel.selected_effective_tp_key()
+            if selected:
+                return selected
         return get_session_manager().effective_tp_key(self._current_tp_key)
 
     def refresh_library(self) -> None:
         """Re-scan disk and repopulate the Knowledge Library dataset list."""
         if self._dataset_library is not None:
             self._dataset_library.refresh()
+
+    def _set_repo_busy(self, busy: bool, status_text: str = "") -> None:
+        self._repo_progress.setVisible(busy)
+        self._repo_progress.setRange(0, 0 if busy else 1)
+        if not busy:
+            self._repo_progress.setValue(1)
+
+        for w in (self._repo_browse_btn, self._repo_prep_btn, self._repo_rebuild_btn, self._repo_model_combo):
+            w.setEnabled(not busy)
+
+        if status_text:
+            self._repo_prep_status.setText(status_text)
+        self._repo_prep_status.setVisible(self._mode_repo_rb.isChecked() and self._custom_title_edit.isVisible())
+        QApplication.processEvents()
+
+    def _derive_repo_topic_title(self, repo_path: Path) -> str:
+        label = repo_path.name.strip().replace("_", " ").replace("-", " ").replace(".", " ")
+        label = " ".join(label.split()) or "Repository"
+
+        for name in ("README.md", "README.rst", "README.txt", "readme.md"):
+            p = repo_path / name
+            if not p.exists() or not p.is_file():
+                continue
+            try:
+                for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    s = raw.strip()
+                    if not s:
+                        continue
+                    if s.startswith("#"):
+                        s = s.lstrip("#").strip()
+                    if len(s) >= 4:
+                        label = s
+                        raise StopIteration
+            except StopIteration:
+                break
+            except Exception:
+                continue
+
+        if "debate" in label.lower():
+            return label[:90]
+        return f"{label[:72]} System Debate"
+
+    @staticmethod
+    def _is_generic_custom_title(title: str) -> bool:
+        t = title.strip().lower()
+        return not t or t in {"custom", "custom topic", "custom debate"}
 
     # ── Build ────────────────────────────────────────────────────────────────
 
@@ -1282,9 +1692,10 @@ class TopicPickerDialog(QDialog):
         hl.addStretch()
         root.addWidget(header)
 
-        # Splitter: left cards | right detail
+        # Splitter: main wall | assistant (2 windows only)
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet("QSplitter::handle { background: #1e2d42; width: 1px; }")
+        splitter.setHandleWidth(0)
+        splitter.setStyleSheet("QSplitter::handle { width: 0px; background: transparent; }")
 
         # ── Left: card list ──────────────────────────────────────────────────
         left_container = QWidget()
@@ -1311,9 +1722,19 @@ class TopicPickerDialog(QDialog):
         self._rebuild_left_cards()
         scroll.setWidget(card_widget)
         left_lay.addWidget(scroll)
-        splitter.addWidget(left_container)
 
-        # ── Right: detail / edit panel ───────────────────────────────────────
+        # ── Right: detail / edit panel (vertically scrollable) ──────────────
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setStyleSheet(
+            f"QScrollArea {{ background: {_PALETTE['panel']}; border: none; }}"
+            f"QScrollBar:vertical {{ background: #0a1018; width: 6px; border-radius: 3px; }}"
+            f"QScrollBar::handle:vertical {{ background: #2a3a55; border-radius: 3px; }}"
+        )
+
         right_container = QWidget()
         right_container.setStyleSheet(f"background: {_PALETTE['panel']};")
         right_lay = QVBoxLayout(right_container)
@@ -1336,6 +1757,8 @@ class TopicPickerDialog(QDialog):
             f"QLineEdit:focus {{ border-color: {_PALETTE['accent']}; }}"
         )
         self._custom_title_edit.hide()
+        self._custom_title_edit.textChanged.connect(self._schedule_active_session_autosave)
+        self._custom_title_edit.textChanged.connect(lambda _t: self._refresh_assistant_context())
 
         title_row.addWidget(self._preset_title_lbl, stretch=1)
         title_row.addWidget(self._custom_title_edit, stretch=1)
@@ -1368,6 +1791,8 @@ class TopicPickerDialog(QDialog):
 
         self._mode_static_rb.toggled.connect(self._on_custom_mode_changed)
         self._mode_repo_rb.toggled.connect(self._on_custom_mode_changed)
+        self._mode_static_rb.toggled.connect(lambda _v: self._refresh_assistant_context())
+        self._mode_repo_rb.toggled.connect(lambda _v: self._refresh_assistant_context())
 
         mode_lay.addWidget(self._mode_static_rb)
         mode_lay.addWidget(self._mode_repo_rb)
@@ -1381,6 +1806,7 @@ class TopicPickerDialog(QDialog):
             f"QLineEdit:focus {{ border-color: {_PALETTE['accent']}; }}"
         )
         self._repo_path_edit.setVisible(False)
+        self._repo_path_edit.textChanged.connect(lambda _t: self._refresh_assistant_context())
 
         self._repo_browse_btn = QPushButton("📂  Link Repo")
         self._repo_browse_btn.setVisible(False)
@@ -1403,7 +1829,18 @@ class TopicPickerDialog(QDialog):
         self._repo_hint_lbl.setVisible(False)
         mode_lay.addWidget(self._repo_hint_lbl)
 
-        prep_row = QHBoxLayout()
+        self._repo_progress = QProgressBar()
+        self._repo_progress.setVisible(False)
+        self._repo_progress.setTextVisible(False)
+        self._repo_progress.setMaximumHeight(8)
+        self._repo_progress.setRange(0, 0)
+        self._repo_progress.setStyleSheet(
+            "QProgressBar { background: #0a1520; border: 1px solid #1e2d42; border-radius: 4px; }"
+            "QProgressBar::chunk { background: #00acc1; border-radius: 3px; }"
+        )
+        mode_lay.addWidget(self._repo_progress)
+
+        prep_top_row = QHBoxLayout()
         self._repo_prep_btn = QPushButton("🧠  Analyze Repo & Fill Debate Schema")
         self._repo_prep_btn.setVisible(False)
         self._repo_prep_btn.setStyleSheet(
@@ -1426,7 +1863,7 @@ class TopicPickerDialog(QDialog):
 
         self._repo_model_combo = QComboBox()
         self._repo_model_combo.setVisible(False)
-        self._repo_model_combo.setMinimumWidth(210)
+        self._repo_model_combo.setMinimumWidth(150)
         self._repo_model_combo.setStyleSheet(
             f"QComboBox {{ background: {_PALETTE['bg']}; color: {_PALETTE['text']};"
             f" border: 1px solid {_PALETTE['border']}; border-radius: 6px; padding: 4px 8px;"
@@ -1439,10 +1876,8 @@ class TopicPickerDialog(QDialog):
         self._repo_prep_status = QLabel("")
         self._repo_prep_status.setVisible(False)
         self._repo_prep_status.setStyleSheet("color: #7e57c2; font-size: 10px; font-style: italic;")
-        prep_row.addWidget(self._repo_prep_btn)
-        prep_row.addWidget(self._repo_allow_cloud_cb)
-        prep_row.addWidget(self._repo_model_combo)
-        prep_row.addWidget(self._repo_prep_status)
+        prep_top_row.addWidget(self._repo_prep_btn)
+        prep_top_row.addStretch()
 
         self._repo_rebuild_btn = QPushButton("\U0001f504  Rebuild Dataset")
         self._repo_rebuild_btn.setVisible(False)
@@ -1457,12 +1892,27 @@ class TopicPickerDialog(QDialog):
             "QPushButton:disabled { color: #546e7a; border-color: #2a3a55; }"
         )
         self._repo_rebuild_btn.clicked.connect(self._on_rebuild_dataset_clicked)
-        prep_row.addWidget(self._repo_rebuild_btn)
 
-        prep_row.addStretch()
-        mode_lay.addLayout(prep_row)
+        prep_bottom_row = QHBoxLayout()
+        prep_bottom_row.addWidget(self._repo_allow_cloud_cb)
+        prep_bottom_row.addWidget(self._repo_model_combo)
+        prep_bottom_row.addWidget(self._repo_prep_status)
+        prep_bottom_row.addWidget(self._repo_rebuild_btn)
+        prep_bottom_row.addStretch()
+
+        mode_lay.addLayout(prep_top_row)
+        mode_lay.addLayout(prep_bottom_row)
 
         right_lay.addWidget(mode_grp)
+
+        # ── Session history panel (embedded in middle wall) ────────────────
+        self._history_panel = _SessionHistoryPanel()
+        self._history_panel.start_requested.connect(self._on_confirm)
+        self._history_panel.session_clicked.connect(self._on_session_card_clicked)
+        self._history_panel.refine_requested.connect(self._on_manual_refine_requested)
+        self._history_panel.thread_reset.connect(lambda: self._select_topic(self._selected_index))
+        self._history_panel.data_cleared.connect(lambda: self._select_topic(self._selected_index))
+        right_lay.addWidget(self._history_panel)
 
         # Description block
         desc_grp = QGroupBox("Topic Description & Context")
@@ -1479,6 +1929,8 @@ class TopicPickerDialog(QDialog):
             f"QTextEdit:focus {{ border-color: {_PALETTE['accent']}; }}"
         )
         desc_gl.addWidget(self._desc_edit)
+        self._desc_edit.textChanged.connect(self._schedule_active_session_autosave)
+        self._desc_edit.textChanged.connect(lambda: self._refresh_assistant_context())
         right_lay.addWidget(desc_grp)
 
         # Talking points block
@@ -1495,6 +1947,8 @@ class TopicPickerDialog(QDialog):
         )
         self._tp_edit.setMinimumHeight(120)
         tp_gl.addWidget(self._tp_edit)
+        self._tp_edit.textChanged.connect(self._schedule_active_session_autosave)
+        self._tp_edit.textChanged.connect(lambda: self._refresh_assistant_context())
 
         # Rewrite button row
         rewrite_row = QHBoxLayout()
@@ -1589,6 +2043,8 @@ class TopicPickerDialog(QDialog):
         confirm_row = QHBoxLayout()
         self._topic_badge = QLabel("")
         self._topic_badge.setStyleSheet(f"color: {_PALETTE['dim']}; font-size: 11px;")
+        self._session_autosave_lbl = QLabel("")
+        self._session_autosave_lbl.setStyleSheet(f"color: {_PALETTE['dim']}; font-size: 10px;")
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setStyleSheet(
             "QPushButton { background: #263238; color: #90a4ae; border-radius: 6px;"
@@ -1597,7 +2053,7 @@ class TopicPickerDialog(QDialog):
         )
         cancel_btn.clicked.connect(self.reject)
 
-        self._confirm_btn = QPushButton("▶  Start This Topic")
+        self._confirm_btn = QPushButton("▶  Go to Session")
         self._confirm_btn.setStyleSheet(
             f"QPushButton {{ background: {_PALETTE['ok']}; color: #fff; font-weight: 700;"
             f" border-radius: 8px; padding: 9px 26px; font-size: 13px;"
@@ -1607,42 +2063,74 @@ class TopicPickerDialog(QDialog):
         self._confirm_btn.clicked.connect(self._on_confirm)
 
         confirm_row.addWidget(self._topic_badge)
+        confirm_row.addSpacing(10)
+        confirm_row.addWidget(self._session_autosave_lbl)
         confirm_row.addStretch()
         confirm_row.addWidget(cancel_btn)
         confirm_row.addSpacing(8)
         confirm_row.addWidget(self._confirm_btn)
         right_lay.addLayout(confirm_row)
 
-        splitter.addWidget(right_container)
+        right_scroll.setWidget(right_container)
 
-        # ── Session history panel ────────────────────────────────────────────
-        self._history_panel = _SessionHistoryPanel()
-        self._history_panel.start_requested.connect(self._on_confirm)
-        self._history_panel.session_clicked.connect(self._on_session_card_clicked)
-        # When user resets or clears, re-select the topic so the detail panel
-        # also refreshes (strips stale refinement badge, etc.)
-        self._history_panel.thread_reset.connect(lambda: self._select_topic(self._selected_index))
-        self._history_panel.data_cleared.connect(lambda: self._select_topic(self._selected_index))
-        splitter.addWidget(self._history_panel)
-
-        # ── Transcript viewer panel (starts collapsed) ───────────────────────
-        self._transcript_panel = _TranscriptViewerPanel()
-        splitter.addWidget(self._transcript_panel)
-        self._transcript_panel.set_splitter(splitter, 3)
+        # Main wall combines topic cards + middle scrollable editor/history wall
+        main_wall = QWidget()
+        main_wall.setStyleSheet("background: transparent;")
+        main_wall_lay = QHBoxLayout(main_wall)
+        main_wall_lay.setContentsMargins(0, 0, 0, 0)
+        main_wall_lay.setSpacing(0)
+        main_wall_lay.addWidget(left_container)
+        main_wall_lay.addWidget(right_scroll, stretch=1)
+        splitter.addWidget(main_wall)
 
         # ── Debate Assistant panel (5th pane) ────────────────────────────────
         self._assistant_panel = _AssistantChatPanel()
+        self._assistant_panel.setMinimumWidth(260)
         self._assistant_panel.topic_created.connect(self._on_assistant_topic_created)
         splitter.addWidget(self._assistant_panel)
 
-        splitter.setSizes([_CARD_W + 32, 480, 280, 0, 320])
+        total_w = max(self.width(), 960)
+        assistant_w = min(360, max(260, int(total_w * 0.22)))
+        main_w = max(640, total_w - assistant_w - 16)
+        splitter.setSizes([main_w, assistant_w])
+        splitter.setCollapsible(1, False)
+        try:
+            handle = splitter.handle(1)
+            if handle is not None:
+                handle.setEnabled(False)
+                handle.setCursor(Qt.CursorShape.ArrowCursor)
+        except Exception:
+            pass
         self._main_splitter = splitter
         root.addWidget(splitter, stretch=1)
 
         # Select initial topic
-        start_idx = next(
-            (i for i, t in enumerate(STARTER_TOPICS) if t.title == current_title), 0
+        starter_choice = next(
+            (i for i, t in enumerate(STARTER_TOPICS) if t.title == current_title),
+            -1,
         )
+        start_idx = -1
+        if starter_choice >= 0:
+            start_idx = next(
+                (
+                    i for i, entry in enumerate(self._card_entries)
+                    if entry.get("kind") == "starter" and int(entry.get("index", -1)) == starter_choice
+                ),
+                -1,
+            )
+        if start_idx < 0 and self._initial_title:
+            target = self._initial_title.lower()
+            for idx, entry in enumerate(self._card_entries):
+                if entry.get("kind") != "custom":
+                    continue
+                debate = self._find_custom_debate(str(entry.get("id", "")))
+                if debate is None:
+                    continue
+                if debate.title.strip().lower() == target:
+                    start_idx = idx
+                    break
+        if start_idx < 0:
+            start_idx = 0
         self._select_topic(start_idx)
 
     # ── Topic selection ──────────────────────────────────────────────────────
@@ -1666,7 +2154,28 @@ class TopicPickerDialog(QDialog):
         self._card_entries.clear()
 
         index = 0
+        custom_starter_index = next(
+            (i for i, topic in enumerate(STARTER_TOPICS) if _is_custom_topic_title(topic.title)),
+            -1,
+        )
+
+        if custom_starter_index >= 0:
+            topic = STARTER_TOPICS[custom_starter_index]
+            card = _TopicCard(
+                index,
+                title=topic.title,
+                description=topic.description,
+                talking_points_count=len(topic.talking_points),
+            )
+            card.clicked.connect(self._select_topic)
+            self._cards.append(card)
+            self._card_entries.append({"kind": "starter", "index": custom_starter_index})
+            self._card_col.addWidget(card)
+            index += 1
+
         for starter_index, topic in enumerate(STARTER_TOPICS):
+            if starter_index == custom_starter_index:
+                continue
             card = _TopicCard(
                 index,
                 title=topic.title,
@@ -1783,6 +2292,10 @@ class TopicPickerDialog(QDialog):
         if index < 0 or index >= len(self._card_entries):
             return
 
+        self._active_session_brief_id = ""
+        self._session_autosave_timer.stop()
+        self._set_session_autosave_status("")
+
         for i, card in enumerate(self._cards):
             card.set_selected(i == index)
         self._selected_index = index
@@ -1793,6 +2306,7 @@ class TopicPickerDialog(QDialog):
             if debate is None:
                 return
 
+            self._seed_source_session_id = ""
             self._active_custom_id = debate.id
             self._preset_title_lbl.setVisible(False)
             self._custom_mode_group.setVisible(True)
@@ -1811,10 +2325,26 @@ class TopicPickerDialog(QDialog):
                 self._mode_static_rb.setChecked(True)
             self._on_custom_mode_changed()
 
-            first_tp_line = (debate.talking_points[0] if debate.talking_points else "").strip()
-            self._current_tp_key = _tp_key(debate.title, first_tp_line)
-            self._confirm_btn.setText("▶  Start Custom Debate")
-            pts = len(debate.talking_points)
+            self._current_tp_key = self._resolve_custom_tp_key(debate)
+
+            sm = get_session_manager()
+            refinement = sm.load_tp_refinement(sm.effective_tp_key(self._current_tp_key)) if self._current_tp_key else None
+            if isinstance(refinement, dict):
+                refined_desc = str(refinement.get("description", "") or "").strip()
+                refined_tps_raw = refinement.get("talking_points", [])
+                refined_tps = [
+                    str(tp).strip() for tp in refined_tps_raw
+                    if str(tp).strip()
+                ] if isinstance(refined_tps_raw, list) else []
+                brief = str(refinement.get("session_brief", "") or "").strip()
+                if refined_desc:
+                    badge = f"✨ Refined after session — last: \"{brief[:80]}\"\n\n" if brief else "✨ Refined\n\n"
+                    self._desc_edit.setPlainText(badge + refined_desc)
+                if refined_tps:
+                    self._tp_edit.setPlainText("\n".join(refined_tps))
+
+            self._confirm_btn.setText("▶  Go to Custom Session")
+            pts = len([ln for ln in self._tp_edit.toPlainText().splitlines() if ln.strip()])
             suffix = "  ·  repo linked" if debate.mode == "repo_watchdog" else ""
             self._topic_badge.setText(f"  {pts} talking points{suffix}" if pts else suffix)
 
@@ -1822,6 +2352,20 @@ class TopicPickerDialog(QDialog):
                 self._history_panel.load_sessions(self._current_tp_key)
             elif self._history_panel is not None:
                 self._history_panel.load_sessions("")
+
+            # Auto-seed the next session form from the latest saved session config.
+            eff_key = sm.effective_tp_key(self._current_tp_key) if self._current_tp_key else ""
+            latest = sm.list_sessions_for_tp(eff_key) if eff_key else []
+            has_widget_draft = bool(
+                (debate.description or "").strip()
+                or any(str(tp).strip() for tp in (debate.talking_points or []))
+            )
+            should_skip_seed = self._skip_next_auto_seed_from_session
+            self._skip_next_auto_seed_from_session = False
+            if latest and not has_widget_draft and not should_skip_seed:
+                self._load_session_brief_into_editor(latest[0].session_id)
+                if not self._seed_source_session_id:
+                    self._seed_source_session_id = latest[0].session_id
             return
 
         starter_index = int(entry.get("index", 0))
@@ -1839,6 +2383,7 @@ class TopicPickerDialog(QDialog):
         # Compute default tp_key from the first talking point (or topic title for custom)
         if is_custom:
             self._active_custom_id = None
+            self._seed_source_session_id = ""
             self._repo_schema_generated_once = False
             self._current_tp_key = ""
             self._custom_title_edit.setText("")
@@ -1858,10 +2403,11 @@ class TopicPickerDialog(QDialog):
                 "Is consciousness purely physical or is there something irreducibly subjective?\n"
                 "If determinism is true, can moral responsibility exist?"
             )
-            self._confirm_btn.setText("▶  Start Custom Debate")
+            self._confirm_btn.setText("▶  Go to Custom Session")
             self._on_custom_mode_changed()
         else:
             self._active_custom_id = None
+            self._seed_source_session_id = ""
             self._preset_title_lbl.setText(topic.title)
             self._desc_edit.setReadOnly(False)
             self._tp_edit.setReadOnly(False)
@@ -1885,7 +2431,7 @@ class TopicPickerDialog(QDialog):
                 tp_text = "\n\n".join(topic.talking_points)
 
             self._tp_edit.setPlainText(tp_text)
-            self._confirm_btn.setText("▶  Start This Topic")
+            self._confirm_btn.setText("▶  Go to Session")
             self._mode_static_rb.setChecked(True)
             self._on_custom_mode_changed()
 
@@ -1899,10 +2445,419 @@ class TopicPickerDialog(QDialog):
         elif self._history_panel is not None:
             self._history_panel.load_sessions("")
 
+        self._refresh_assistant_context()
+
     def _on_session_card_clicked(self, session_id: str) -> None:
         """Show the transcript for a clicked session card."""
         if self._transcript_panel is not None:
             self._transcript_panel.load_session(session_id)
+        self._load_session_brief_into_editor(session_id)
+        self._refresh_assistant_context()
+
+    def _refresh_assistant_context(self) -> None:
+        if self._assistant_panel is None:
+            return
+
+        title = (
+            self._custom_title_edit.text().strip()
+            if self._custom_title_edit.isVisible()
+            else self._preset_title_lbl.text().strip()
+        )
+        desc = self._desc_edit.toPlainText().strip()
+        tps = [ln.strip() for ln in self._tp_edit.toPlainText().splitlines() if ln.strip()]
+        repo_mode = bool(self._custom_title_edit.isVisible() and self._mode_repo_rb.isChecked())
+        repo_path = self._repo_path_edit.text().strip() if repo_mode else ""
+
+        tp_block = "\n".join(f"- {tp}" for tp in tps[:12])
+        context = (
+            f"Active title: {title}\n"
+            f"Repo mode: {'yes' if repo_mode else 'no'}\n"
+            f"Repo path: {repo_path}\n\n"
+            f"Current description draft:\n{desc[:2500]}\n\n"
+            f"Current talking points draft:\n{tp_block}"
+        )
+        self._assistant_panel.set_generation_context(context)
+
+    def _on_manual_refine_requested(self) -> None:
+        effective_tp_key = self.tp_key
+        if not effective_tp_key:
+            QMessageBox.information(
+                self,
+                "Update from Past Sessions",
+                "No talking-point thread is selected for this debate yet.",
+            )
+            return
+        if self._manual_refine_worker is not None and self._manual_refine_worker.isRunning():
+            return
+
+        sm = get_session_manager()
+        sessions = sm.list_sessions_for_tp(effective_tp_key)
+        if not sessions:
+            QMessageBox.information(
+                self,
+                "Update from Past Sessions",
+                "No past sessions exist in this thread yet.",
+            )
+            return
+
+        ordered = sorted(sessions, key=lambda m: m.start_ts)
+        latest = sessions[0]
+
+        title = self._current_editor_title()
+        current_desc = self._strip_refinement_badge(self._desc_edit.toPlainText())
+        current_tps = [ln.strip() for ln in self._tp_edit.toPlainText().splitlines() if ln.strip()]
+
+        baseline_brief = sm.load_session_brief(ordered[0].session_id)
+        if isinstance(baseline_brief, dict):
+            title = str(baseline_brief.get("title", "") or title).strip() or title
+            base_desc = str(baseline_brief.get("description", "") or "").strip()
+            if base_desc:
+                current_desc = base_desc
+            base_tps_raw = baseline_brief.get("talking_points", [])
+            if isinstance(base_tps_raw, list):
+                base_tps = [str(tp).strip() for tp in base_tps_raw if str(tp).strip()]
+                if base_tps:
+                    current_tps = base_tps
+
+        continuation_context = self._build_refine_continuation_context(
+            tp_key=effective_tp_key,
+            sessions=sessions,
+            current_title=title,
+            current_description=current_desc,
+            current_talking_points=current_tps,
+        )
+        resolution_data = self._build_refine_resolution_data_for_sessions(sessions)
+        scoring_data = sm.load_scoring_report(latest.session_id) or {}
+        diagnostics_data = sm.load_session_diagnostics(latest.session_id) or sm.build_session_diagnostics(latest.session_id, latest)
+        graph_rows = sm.load_session_graph(latest.session_id)
+        session_brief_data = sm.load_session_brief(latest.session_id) or {}
+
+        model = ""
+        if self._assistant_panel is not None:
+            model = self._assistant_panel.selected_model()
+        if not model:
+            try:
+                from config.model_prefs import load_model_prefs
+                model = load_model_prefs().get("right_model", "qwen3:30b") or "qwen3:30b"
+            except Exception:
+                model = "qwen3:30b"
+
+        self._manual_refine_tp_key = effective_tp_key
+        self._manual_refine_session_id = latest.session_id
+        self._manual_refine_worker = TopicRefineWorker(
+            title=title,
+            description=current_desc,
+            talking_points=current_tps,
+            resolution_data=resolution_data,
+            scoring_data=scoring_data if isinstance(scoring_data, dict) else {},
+            diagnostics_data=diagnostics_data if isinstance(diagnostics_data, dict) else {},
+            graph_rows=graph_rows if isinstance(graph_rows, list) else [],
+            session_brief_data=session_brief_data if isinstance(session_brief_data, dict) else {},
+            continuation_context=continuation_context,
+            model=model,
+            tp_key=effective_tp_key,
+            session_manager=sm,
+            parent=self,
+        )
+        self._manual_refine_worker.finished.connect(self._on_manual_refine_done)
+        self._manual_refine_worker.failed.connect(self._on_manual_refine_failed)
+        if self._history_panel is not None:
+            self._history_panel.set_refine_busy(True)
+        self._manual_refine_worker.start()
+
+    def _on_manual_refine_done(self, result: dict) -> None:
+        if self._history_panel is not None:
+            self._history_panel.set_refine_busy(False)
+
+        description = str(result.get("description", "") or "").strip()
+        talking_points_raw = result.get("talking_points", [])
+        talking_points = [str(tp).strip() for tp in talking_points_raw if str(tp).strip()] if isinstance(talking_points_raw, list) else []
+        brief = str(result.get("session_brief", "") or "").strip()
+
+        if description:
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            badge = f"✨ Manual thread refinement ({stamp})"
+            if brief:
+                badge += f" — {brief[:120]}"
+            self._desc_edit.setPlainText(f"{badge}\n\n{description}")
+        if talking_points:
+            self._tp_edit.setPlainText("\n".join(talking_points))
+
+        if self._custom_title_edit.isVisible() and self._custom_title_edit.text().strip():
+            self._upsert_current_custom_debate()
+
+        if self._history_panel is not None and self._current_tp_key:
+            self._history_panel.load_sessions(self._current_tp_key)
+
+        self._refresh_assistant_context()
+        self._set_session_autosave_status("Manual refinement applied", tone="ok")
+        QMessageBox.information(
+            self,
+            "Update from Past Sessions",
+            "Debate description and talking points were updated from thread history.",
+        )
+        self._manual_refine_worker = None
+
+    def _on_manual_refine_failed(self, error: str) -> None:
+        if self._history_panel is not None:
+            self._history_panel.set_refine_busy(False)
+        self._set_session_autosave_status("Manual refinement failed", tone="err")
+        QMessageBox.warning(
+            self,
+            "Update from Past Sessions",
+            f"Manual refinement failed:\n{str(error)[:260]}",
+        )
+        self._manual_refine_worker = None
+
+    def _build_refine_resolution_data_for_sessions(self, sessions: list[SessionMeta]) -> dict:
+        sm = get_session_manager()
+        truths: list[str] = []
+        problems: list[str] = []
+        sub_topics: list[str] = []
+        total_memory_facts = 0
+
+        for meta in sessions:
+            for ev in sm.load_session_transcript(meta.session_id):
+                if not isinstance(ev, dict):
+                    continue
+                etype = str(ev.get("event_type", "") or "").strip()
+                payload = ev.get("payload", {}) if isinstance(ev.get("payload", {}), dict) else {}
+
+                if etype == "resolution":
+                    truths.extend(str(x).strip() for x in payload.get("truths_discovered", []) if str(x).strip())
+                    problems.extend(str(x).strip() for x in payload.get("problems_found", []) if str(x).strip())
+                    sub_topics.extend(str(x).strip() for x in payload.get("sub_topics_explored", []) if str(x).strip())
+                    try:
+                        total_memory_facts = max(total_memory_facts, int(payload.get("total_memory_facts", 0) or 0))
+                    except Exception:
+                        pass
+                    continue
+
+                if etype not in {"public_message", "turn"}:
+                    continue
+                text = str(payload.get("message", "") or payload.get("text", "") or "")
+                if not text:
+                    continue
+                truths.extend(self._extract_signal_lines(text, ("TRUTH:", "VERIFIED:", "CONCLUDE:"), max_items=8))
+                problems.extend(self._extract_signal_lines(text, ("PROBLEM:", "QUESTION:", "HYPOTHETICAL:", "UNRESOLVED:"), max_items=8))
+                sub_topics.extend(self._extract_signal_lines(text, ("EXPAND-TOPIC:",), max_items=5))
+
+        return {
+            "truths": self._dedupe_trim(truths, max_items=80),
+            "problems": self._dedupe_trim(problems, max_items=120),
+            "sub_topics": self._dedupe_trim(sub_topics, max_items=80),
+            "total_memory_facts": total_memory_facts,
+        }
+
+    def _build_refine_continuation_context(
+        self,
+        *,
+        tp_key: str,
+        sessions: list[SessionMeta],
+        current_title: str,
+        current_description: str,
+        current_talking_points: list[str],
+    ) -> dict:
+        sm = get_session_manager()
+        ordered = sorted(sessions, key=lambda m: m.start_ts)
+
+        original_payload = {
+            "title": current_title,
+            "description": current_description,
+            "talking_points": list(current_talking_points),
+            "session_id": ordered[0].session_id if ordered else "",
+        }
+
+        if ordered:
+            first_meta = ordered[0]
+            first_brief = sm.load_session_brief(first_meta.session_id)
+            if isinstance(first_brief, dict):
+                original_payload["title"] = str(first_brief.get("title", "") or original_payload["title"]).strip()
+                original_payload["description"] = str(first_brief.get("description", "") or original_payload["description"]).strip()
+                raw = first_brief.get("talking_points", [])
+                if isinstance(raw, list):
+                    tps = [str(tp).strip() for tp in raw if str(tp).strip()]
+                    if tps:
+                        original_payload["talking_points"] = tps
+
+        agreements: list[str] = []
+        disagreements: list[str] = []
+        open_problems: list[str] = []
+        unresolved: list[str] = []
+        covered_ground: list[str] = []
+        transcript_signals: list[str] = []
+        scoring_trend: list[str] = []
+
+        seen_agree: set[str] = set()
+        seen_disagree: set[str] = set()
+        seen_problem: set[str] = set()
+        seen_unresolved: set[str] = set()
+        seen_covered: set[str] = set()
+        seen_signal: set[str] = set()
+
+        for meta in ordered:
+            sid = meta.session_id
+            brief = sm.load_session_brief(sid)
+            if isinstance(brief, dict):
+                raw_tps = brief.get("talking_points", [])
+                if isinstance(raw_tps, list):
+                    self._append_unique(
+                        covered_ground,
+                        [str(tp).strip() for tp in raw_tps if str(tp).strip()],
+                        seen_covered,
+                        max_items=100,
+                    )
+
+            sig = self._collect_refine_session_signals(sid)
+            self._append_unique(agreements, sig.get("agreements", []), seen_agree, max_items=80)
+            self._append_unique(disagreements, sig.get("disagreements", []), seen_disagree, max_items=80)
+            self._append_unique(open_problems, sig.get("problems", []), seen_problem, max_items=120)
+            self._append_unique(unresolved, sig.get("unresolved", []), seen_unresolved, max_items=120)
+            self._append_unique(transcript_signals, sig.get("signals", []), seen_signal, max_items=120)
+
+            score = sm.load_scoring_report(sid)
+            if isinstance(score, dict):
+                winner = str(score.get("winner", "Draw") or "Draw").strip()
+                margin = str(score.get("margin", "") or "").strip()
+                turns = int(score.get("turns", 0) or 0)
+                summary = str(score.get("summary", "") or "").strip()
+                scoring_trend.append(
+                    f"{sid}: winner={winner} margin={margin or 'n/a'} turns={turns} summary={summary[:160]}"
+                )
+
+        return {
+            "thread_session_count": len(ordered),
+            "thread_session_ids": [m.session_id for m in ordered],
+            "tp_key": tp_key,
+            "original": original_payload,
+            "current": {
+                "title": current_title,
+                "description": current_description,
+                "talking_points": list(current_talking_points),
+                "session_id": sessions[0].session_id if sessions else "",
+            },
+            "agreements": agreements,
+            "disagreements": disagreements,
+            "open_problems": open_problems,
+            "unresolved": unresolved,
+            "covered_ground": covered_ground,
+            "transcript_signals": transcript_signals,
+            "scoring_trend": scoring_trend[:24],
+        }
+
+    def _collect_refine_session_signals(self, session_id: str) -> dict:
+        sm = get_session_manager()
+        events = sm.load_session_transcript(session_id)
+
+        agreements: list[str] = []
+        disagreements: list[str] = []
+        problems: list[str] = []
+        unresolved: list[str] = []
+        signals: list[str] = []
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            etype = str(ev.get("event_type", "") or "").strip()
+            payload = ev.get("payload", {}) if isinstance(ev.get("payload", {}), dict) else {}
+
+            if etype == "resolution":
+                agreements.extend(str(x).strip() for x in payload.get("truths_discovered", []) if str(x).strip())
+                problems.extend(str(x).strip() for x in payload.get("problems_found", []) if str(x).strip())
+                continue
+
+            if etype not in {"public_message", "turn"}:
+                continue
+
+            text = str(payload.get("message", "") or payload.get("text", "") or "")
+            if not text:
+                continue
+
+            agreements.extend(self._extract_signal_lines(text, ("TRUTH:", "VERIFIED:", "CONCLUDE:"), max_items=8))
+            disagreements.extend(self._extract_signal_lines(text, ("CONTRADICT:", "FALSE:"), max_items=8))
+            problems.extend(self._extract_signal_lines(text, ("PROBLEM:",), max_items=8))
+            unresolved.extend(self._extract_signal_lines(text, ("QUESTION:", "HYPOTHETICAL:", "UNRESOLVED:"), max_items=8))
+
+            for line in text.splitlines():
+                s = " ".join(line.split()).strip()
+                if not s:
+                    continue
+                if s.endswith("?") and len(s) > 30:
+                    unresolved.append(s)
+                if any(tok in s.upper() for tok in ("PROBLEM:", "QUESTION:", "UNRESOLVED:", "HYPOTHETICAL:")):
+                    signals.append(s[:260])
+
+        return {
+            "agreements": self._dedupe_trim(agreements, max_items=60),
+            "disagreements": self._dedupe_trim(disagreements, max_items=60),
+            "problems": self._dedupe_trim(problems, max_items=100),
+            "unresolved": self._dedupe_trim(unresolved, max_items=100),
+            "signals": self._dedupe_trim(signals, max_items=100),
+        }
+
+    @staticmethod
+    def _extract_signal_lines(text: str, prefixes: tuple[str, ...], max_items: int = 8) -> list[str]:
+        out: list[str] = []
+        upper_prefixes = tuple(p.upper() for p in prefixes)
+        for line in text.splitlines():
+            s = " ".join(line.split()).strip()
+            if not s:
+                continue
+            us = s.upper()
+            for pref in upper_prefixes:
+                if us.startswith(pref):
+                    item = s[len(pref):].strip(" -:\t")
+                    if item:
+                        out.append(item[:260])
+                    break
+            if len(out) >= max_items:
+                break
+        return out
+
+    @staticmethod
+    def _dedupe_trim(items: list[str], max_items: int = 40) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in items:
+            s = " ".join(str(raw).split()).strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+            if len(out) >= max_items:
+                break
+        return out
+
+    @staticmethod
+    def _append_unique(target: list[str], additions: list[str], seen: set[str], *, max_items: int) -> None:
+        for raw in additions:
+            s = " ".join(str(raw).split()).strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            target.append(s)
+            if len(target) >= max_items:
+                break
+
+    @staticmethod
+    def _strip_refinement_badge(text: str) -> str:
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("✨"):
+            lines = lines[1:]
+            if lines and not lines[0].strip():
+                lines = lines[1:]
+        return "\n".join(lines).strip()
+
+    def _current_editor_title(self) -> str:
+        if self._custom_title_edit.isVisible():
+            return self._custom_title_edit.text().strip() or self._preset_title_lbl.text().strip()
+        return self._preset_title_lbl.text().strip()
 
     # ── File ingestion ───────────────────────────────────────────────────────
 
@@ -1965,15 +2920,37 @@ class TopicPickerDialog(QDialog):
     def _browse_repo(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select repository folder")
         if folder:
+            self._set_repo_busy(True, "Linking repository…")
             self._repo_path_edit.setText(folder)
+            try:
+                repo_path = Path(folder)
+                if self._is_generic_custom_title(self._custom_title_edit.text()):
+                    self._custom_title_edit.setText(self._derive_repo_topic_title(repo_path))
+
+                if not self._desc_edit.toPlainText().strip():
+                    repo_name = repo_path.name.strip() or "repository"
+                    self._desc_edit.setPlainText(
+                        f"Debate the architecture, reliability, and trade-offs in the {repo_name} codebase. "
+                        "Focus on concrete modules, data flows, and operational risks based on repository evidence."
+                    )
+
+                saved = self._upsert_current_custom_debate()
+                if saved is not None:
+                    self._repo_prep_status.setText(f"✓ Repo linked — widget updated: {saved.title}")
+                else:
+                    self._repo_prep_status.setText("✓ Repo linked")
+            finally:
+                self._set_repo_busy(False)
 
     def _on_custom_mode_changed(self) -> None:
         is_repo_mode = self._mode_repo_rb.isChecked() and self._custom_title_edit.isVisible()
         self._repo_path_edit.setVisible(is_repo_mode)
         self._repo_browse_btn.setVisible(is_repo_mode)
         self._repo_hint_lbl.setVisible(is_repo_mode)
+        self._repo_progress.setVisible(is_repo_mode and self._repo_progress.isVisible())
         self._repo_prep_btn.setVisible(is_repo_mode)
-        self._repo_allow_cloud_cb.setVisible(is_repo_mode)
+        self._repo_allow_cloud_cb.setChecked(False)
+        self._repo_allow_cloud_cb.setVisible(False)
         self._repo_model_combo.setVisible(is_repo_mode)
         self._repo_prep_status.setVisible(is_repo_mode)
         self._repo_rebuild_btn.setVisible(is_repo_mode)
@@ -1981,6 +2958,7 @@ class TopicPickerDialog(QDialog):
             self._load_repo_prep_models(fetch=True)
 
     def _on_repo_cloud_toggled(self, _checked: bool) -> None:
+        self._repo_allow_cloud_cb.setChecked(False)
         self._load_repo_prep_models(fetch=False)
 
     @staticmethod
@@ -2018,10 +2996,8 @@ class TopicPickerDialog(QDialog):
         if not self._repo_all_models:
             self._repo_all_models = [fallback_model]
 
-        allow_cloud = self._repo_allow_cloud_cb.isChecked()
         local_models = [m for m in self._repo_all_models if not self._is_cloud_model_name(m)]
-        cloud_models = [m for m in self._repo_all_models if self._is_cloud_model_name(m)]
-        pool = (local_models + cloud_models) if allow_cloud else local_models
+        pool = local_models
         if not pool:
             pool = [fallback_model]
 
@@ -2082,10 +3058,17 @@ class TopicPickerDialog(QDialog):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        self._set_repo_busy(True, "Building repository snapshot…")
+        user_intent = (
+            f"Title draft:\n{self._custom_title_edit.text().strip()}\n\n"
+            f"Description draft:\n{self._desc_edit.toPlainText().strip()}\n\n"
+            f"Talking points draft:\n{self._tp_edit.toPlainText().strip()}"
+        )
         try:
             snapshot = self._repo_watchdog.build_snapshot(str(repo_path))
             brief = self._repo_watchdog.build_context_brief(snapshot)
         except Exception as exc:
+            self._set_repo_busy(False)
             QMessageBox.critical(
                 self,
                 "Repo Watchdog",
@@ -2102,6 +3085,7 @@ class TopicPickerDialog(QDialog):
         self._repo_schema_worker = _RepoSchemaWorker(
             repo_path=str(repo_path.resolve()),
             repo_brief=brief,
+            user_intent=user_intent,
             model=model,
             parent=self,
         )
@@ -2110,8 +3094,12 @@ class TopicPickerDialog(QDialog):
         self._repo_schema_worker.start()
 
     def _on_repo_prep_done(self, result: dict) -> None:
+        self._set_repo_busy(False)
         self._repo_prep_btn.setEnabled(True)
         self._repo_schema_generated_once = True
+
+        existing_desc = self._desc_edit.toPlainText().strip()
+        existing_tps = [ln.strip() for ln in self._tp_edit.toPlainText().splitlines() if ln.strip()]
 
         title = result.get("title", "").strip()
         description = result.get("description", "").strip()
@@ -2136,17 +3124,87 @@ class TopicPickerDialog(QDialog):
         if title:
             self._custom_title_edit.setText(title)
         if description:
-            final_desc = description
+            final_desc = self._merge_preserved_user_context(description, existing_desc)
             if schema_lines:
                 final_desc += "\n\nDEBATE PREP SCHEMA:\n" + "\n".join(schema_lines).strip()
             self._desc_edit.setPlainText(final_desc)
         if tps:
-            self._tp_edit.setPlainText("\n".join(str(tp).strip() for tp in tps if str(tp).strip()))
+            merged_tps = self._merge_preserved_talking_points(
+                [str(tp).strip() for tp in tps if str(tp).strip()],
+                existing_tps,
+            )
+            self._tp_edit.setPlainText("\n".join(merged_tps))
 
         self._upsert_current_custom_debate()
         self._repo_prep_status.setText("✓ Repo schema ready — review and start debate")
+        self._refresh_assistant_context()
+
+    @staticmethod
+    def _merge_preserved_user_context(generated_desc: str, existing_desc: str) -> str:
+        g = (generated_desc or "").strip()
+        e = (existing_desc or "").strip()
+        if not e:
+            return g
+
+        g_lower = g.lower()
+        if "preserved user intent" in g_lower:
+            return g
+
+        preserve_lines = TopicPickerDialog._extract_preserve_lines(e, max_lines=8)
+        if not preserve_lines:
+            return g
+
+        block = "\n".join(f"- {ln}" for ln in preserve_lines)
+        return (
+            f"{g}\n\n"
+            "Preserved User Intent:\n"
+            f"{block}"
+        ).strip()
+
+    @staticmethod
+    def _merge_preserved_talking_points(generated_tps: list[str], existing_tps: list[str]) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+
+        def _add(item: str) -> None:
+            s = " ".join((item or "").split()).strip()
+            if not s:
+                return
+            key = s.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            merged.append(s)
+
+        for tp in existing_tps[:4]:
+            _add(tp)
+        for tp in generated_tps:
+            _add(tp)
+
+        return merged[:12]
+
+    @staticmethod
+    def _extract_preserve_lines(text: str, max_lines: int = 8) -> list[str]:
+        import re
+
+        src = (text or "").strip()
+        if not src:
+            return []
+
+        lines: list[str] = []
+        for part in re.split(r"\n+|(?<=[.!?])\s+", src):
+            s = " ".join(part.split()).strip("-• ")
+            if len(s) < 24:
+                continue
+            if len(s) > 210:
+                s = s[:207].rstrip() + "..."
+            lines.append(s)
+            if len(lines) >= max_lines:
+                break
+        return lines
 
     def _on_repo_prep_failed(self, error: str) -> None:
+        self._set_repo_busy(False)
         self._repo_prep_btn.setEnabled(True)
         self._repo_prep_status.setText(f"✗ {error[:100]}")
 
@@ -2162,6 +3220,7 @@ class TopicPickerDialog(QDialog):
         if not Path(repo_path).is_dir():
             QMessageBox.warning(self, "Rebuild Dataset", f"Folder not found:\n{repo_path}")
             return
+        self._set_repo_busy(True, "🔄 Rebuilding dataset…")
         self._repo_rebuild_btn.setEnabled(False)
         self._repo_prep_status.setText("🔄 Rebuilding dataset…")
         self._repo_prep_status.setVisible(True)
@@ -2177,10 +3236,12 @@ class TopicPickerDialog(QDialog):
         self._rebuild_worker.start()
 
     def _on_rebuild_done(self, fact_count: int) -> None:
+        self._set_repo_busy(False)
         self._repo_rebuild_btn.setEnabled(True)
         self._repo_prep_status.setText(f"✓ Dataset rebuilt — {fact_count} chunks")
 
     def _on_rebuild_failed(self, error: str) -> None:
+        self._set_repo_busy(False)
         self._repo_rebuild_btn.setEnabled(True)
         self._repo_prep_status.setText(f"✗ {error[:100]}")
 
@@ -2269,14 +3330,36 @@ class TopicPickerDialog(QDialog):
             return
         description = str(result.get("description", "")).strip()
         tps = [str(tp).strip() for tp in result.get("talking_points", []) if str(tp).strip()]
+
+        mode = "repo_watchdog" if self._mode_repo_rb.isChecked() else "static_ingestion"
+        repo_path = self._repo_path_edit.text().strip() if mode == "repo_watchdog" else ""
+
+        # If we are currently editing a custom debate, update it in place (no duplicate widget).
+        target_id = (self._active_custom_id or "").strip()
+        if not target_id and 0 <= self._selected_index < len(self._card_entries):
+            selected = self._card_entries[self._selected_index]
+            if selected.get("kind") == "custom":
+                target_id = str(selected.get("id", "")).strip()
+        if not target_id:
+            current_title = self._custom_title_edit.text().strip().lower()
+            if current_title:
+                match = next(
+                    (d for d in self._custom_debates if d.title.strip().lower() == current_title),
+                    None,
+                )
+                if match is not None:
+                    target_id = match.id
+
         saved = self._custom_debate_store.upsert(
-            debate_id="",
+            debate_id=target_id,
             title=title,
             description=description,
             talking_points=tps,
-            mode="static_ingestion",
-            repo_path="",
+            mode=mode,
+            repo_path=repo_path,
         )
+        self._skip_next_auto_seed_from_session = True
+        self._active_custom_id = saved.id
         self._load_persisted_custom_debates()
         self._rebuild_left_cards()
         self._select_custom_card_by_id(saved.id)
@@ -2301,9 +3384,11 @@ class TopicPickerDialog(QDialog):
                     " color: #e8eaf6; border-radius: 6px; padding: 8px 12px; font-size: 14px; }}"
                 )
                 return
-            first_tp_line = (self._tp_edit.toPlainText().strip().split("\n")[0]).strip()
-            self._current_tp_key = _tp_key(title, first_tp_line)
-            self._upsert_current_custom_debate()
+            saved = self._upsert_current_custom_debate()
+            if saved is None:
+                return
+            if not self._current_tp_key:
+                self._current_tp_key = _custom_debate_tp_key(saved.id)
         else:
             assert topic is not None
             title = topic.title
@@ -2316,6 +3401,20 @@ class TopicPickerDialog(QDialog):
 
         tp_raw = self._tp_edit.toPlainText().strip()
         tp_lines = [ln.strip() for ln in tp_raw.split("\n") if ln.strip()]
+
+        selected_tp_key = self.tp_key
+
+        # Persist the exact brief config so the session is reproducible and replayable.
+        get_session_manager().pending_session_brief = {
+            "title": title,
+            "description": desc,
+            "talking_points": tp_lines,
+            "mode": "repo_watchdog" if (is_custom and self._mode_repo_rb.isChecked()) else "static_ingestion",
+            "repo_path": self._repo_path_edit.text().strip() if (is_custom and self._mode_repo_rb.isChecked()) else "",
+            "debate_id": self._active_custom_id or "",
+            "talking_point_key": selected_tp_key,
+            "source_session_id": self._seed_source_session_id,
+        }
 
         if tp_lines:
             tp_block = (
@@ -2356,6 +3455,7 @@ class TopicPickerDialog(QDialog):
                     return
 
             try:
+                self._set_repo_busy(True, "Building repository snapshot for debate start…")
                 snapshot = self._repo_watchdog.build_snapshot(str(repo_path))
                 brief = self._repo_watchdog.build_context_brief(snapshot)
             except Exception as exc:
@@ -2365,6 +3465,8 @@ class TopicPickerDialog(QDialog):
                     f"Failed to build repository snapshot:\n{exc}",
                 )
                 return
+            finally:
+                self._set_repo_busy(False)
 
             full_context = (
                 f"{full_context}\n\n"
@@ -2387,6 +3489,118 @@ class TopicPickerDialog(QDialog):
         )
         self.topic_confirmed.emit(title, full_context, files)
         self.accept()
+
+    def _resolve_custom_tp_key(self, debate: CustomDebate) -> str:
+        """Resolve custom debate key with backward compatibility for legacy threads."""
+        sm = get_session_manager()
+        stable = _custom_debate_tp_key(debate.id)
+        stable_sessions = sm.list_sessions_for_tp(sm.effective_tp_key(stable))
+        if stable_sessions:
+            return stable
+
+        legacy_first_tp = (debate.talking_points[0] if debate.talking_points else "").strip()
+        legacy = _tp_key(debate.title, legacy_first_tp)
+        legacy_sessions = sm.list_sessions_for_tp(sm.effective_tp_key(legacy))
+        return legacy if legacy_sessions else stable
+
+    def _load_session_brief_into_editor(self, session_id: str) -> None:
+        data = get_session_manager().load_session_brief(session_id)
+        if not isinstance(data, dict):
+            self._active_session_brief_id = ""
+            self._set_session_autosave_status("", tone="dim")
+            return
+
+        title = str(data.get("title", "")).strip()
+        desc = str(data.get("description", "")).strip()
+        tps = data.get("talking_points", [])
+        mode = str(data.get("mode", "")).strip().lower()
+        repo_path = str(data.get("repo_path", "")).strip()
+
+        self._suspend_session_autosave = True
+        try:
+            if self._custom_title_edit.isVisible() and title:
+                self._custom_title_edit.setText(title)
+            if desc:
+                self._desc_edit.setPlainText(desc)
+            if isinstance(tps, list):
+                clean_tps = [str(tp).strip() for tp in tps if str(tp).strip()]
+                if clean_tps:
+                    self._tp_edit.setPlainText("\n".join(clean_tps))
+
+            if self._custom_title_edit.isVisible():
+                if mode == "repo_watchdog":
+                    self._mode_repo_rb.setChecked(True)
+                elif mode == "static_ingestion":
+                    self._mode_static_rb.setChecked(True)
+                if repo_path:
+                    self._repo_path_edit.setText(repo_path)
+        finally:
+            self._suspend_session_autosave = False
+
+        self._seed_source_session_id = session_id
+        self._active_session_brief_id = session_id
+        self._set_session_autosave_status(
+            f"Editing {session_id} · autosave ON",
+            tone="info",
+        )
+
+    def _schedule_active_session_autosave(self) -> None:
+        if self._suspend_session_autosave:
+            return
+        if not self._active_session_brief_id:
+            return
+        self._set_session_autosave_status("Saving…", tone="dim")
+        self._session_autosave_timer.start()
+
+    def _autosave_active_session_brief(self) -> None:
+        session_id = self._active_session_brief_id.strip()
+        if not session_id:
+            return
+
+        title = (
+            self._custom_title_edit.text().strip()
+            if self._custom_title_edit.isVisible()
+            else self._preset_title_lbl.text().strip()
+        )
+        description = self._desc_edit.toPlainText().strip()
+        talking_points = [ln.strip() for ln in self._tp_edit.toPlainText().split("\n") if ln.strip()]
+
+        mode = ""
+        repo_path = ""
+        if self._custom_title_edit.isVisible():
+            mode = "repo_watchdog" if self._mode_repo_rb.isChecked() else "static_ingestion"
+            repo_path = self._repo_path_edit.text().strip() if mode == "repo_watchdog" else ""
+
+        ok = get_session_manager().save_session_brief(
+            session_id,
+            {
+                "title": title,
+                "description": description,
+                "talking_points": talking_points,
+                "mode": mode,
+                "repo_path": repo_path,
+            },
+            merge_existing=True,
+        )
+        if ok:
+            self._seed_source_session_id = session_id
+            stamp = datetime.now().strftime("%H:%M:%S")
+            self._set_session_autosave_status(f"Saved to {session_id} at {stamp}", tone="ok")
+        else:
+            self._set_session_autosave_status(f"Autosave failed for {session_id}", tone="err")
+
+    def _set_session_autosave_status(self, text: str, tone: str = "dim") -> None:
+        if self._session_autosave_lbl is None:
+            return
+        palette = {
+            "dim": _PALETTE["dim"],
+            "info": "#80cbc4",
+            "ok": "#66bb6a",
+            "err": "#ef9a9a",
+        }
+        color = palette.get(tone, _PALETTE["dim"])
+        self._session_autosave_lbl.setStyleSheet(f"color: {color}; font-size: 10px;")
+        self._session_autosave_lbl.setText(text)
 
     # ── Style ────────────────────────────────────────────────────────────────
 

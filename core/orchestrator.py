@@ -153,14 +153,17 @@ class DebateOrchestrator:
             "rows": self.graph.as_rows(),
             "tree": [
                 {
+                    "node_id": n.node_id,
                     "type":   n.node_type,
                     "label":  n.label,
                     "status": n.status,
+                    "parent_id": n.parent_id,
                     "depth":  n.depth,
                     "order":  n.creation_order,
                 }
                 for n in tree_nodes
             ],
+            "edges": self.graph.as_edges(),
         })
 
     def _emit_transition(self, transition) -> None:
@@ -244,6 +247,27 @@ class DebateOrchestrator:
                 if txt:
                     found.append(txt)
         return found
+
+    def _extract_problem(self, message: str) -> list[str]:
+        """Pull PROBLEM: statements — unresolved tensions or blockers."""
+        found = []
+        for line in message.split("\n"):
+            s = line.strip()
+            if s.upper().startswith("PROBLEM:"):
+                txt = s[8:].strip()
+                if txt:
+                    found.append(txt)
+        return found
+
+    def _extract_runtime_conflict(self, message: str) -> str | None:
+        """Detect provider/runtime failures emitted inline by model providers."""
+        s = (message or "").strip()
+        if not s:
+            return None
+        low = s.lower()
+        if "[local provider error]" in low or "[local provider timeout" in low or "[local provider blocked]" in low:
+            return s
+        return None
 
     def _extract_expand_topic(self, message: str) -> list[str]:
         """Pull EXPAND-TOPIC: additions to the living topic document."""
@@ -373,7 +397,13 @@ class DebateOrchestrator:
                 # relevant chunks for this agent's current focal point
                 ds_context = ""
                 if self._dataset_provider.loaded:
-                    ds_query = f"{topic} {self._active_talking_point_label} {opponent_last[:200]}"
+                    recent_window = "\n".join(conversation_window[-4:]) if conversation_window else ""
+                    ds_query = (
+                        f"{topic}\n"
+                        f"{self._active_talking_point_label}\n"
+                        f"{opponent_last[:300]}\n"
+                        f"{recent_window[:1200]}"
+                    )
                     ds_context = self._dataset_provider.get_context(
                         query=ds_query,
                         agent_name=current_speaker.name,
@@ -436,9 +466,11 @@ class DebateOrchestrator:
                 conclusions     = self._extract_conclude(message)
                 contradictions  = self._extract_contradict(message)
                 falsehoods      = self._extract_false(message)
+                problems        = self._extract_problem(message)
                 expansions      = self._extract_expand_topic(message)
                 verified_claims = self._extract_verified(message)
                 hypotheticals   = self._extract_hypothetical(message)
+                runtime_conflict = self._extract_runtime_conflict(message)
 
                 # Register structured findings with the arbiter
                 for vc in verified_claims:
@@ -458,26 +490,74 @@ class DebateOrchestrator:
                     )
 
                 # -- Update living topic --
+                active_parent_id = (
+                    self.graph.find_latest_node_id_by_label(
+                        self._active_talking_point_label,
+                        node_type="sub-topic",
+                    )
+                    or self._root_talking_point_id
+                    or ""
+                )
+
                 for exp in expansions:
                     self._living_topic.add_expansion(exp, current_speaker.name, turn_index)
                 for conc in conclusions:
                     self._living_topic.append_conclusion(conc, current_speaker.name, turn_index)
                     self._resolution_store.add_conclusion(conc, current_speaker.name, topic, turn_index)
                     self.graph.add_child(
-                        self._root_talking_point_id or "", "conclusion", conc[:120]
+                        active_parent_id,
+                        "conclusion",
+                        conc[:120],
+                        relation="supports",
+                        weight=0.85,
+                        evidence="resolution_conclusion",
+                        turn=turn_index,
                     )
                 for ca, cb in contradictions:
                     other = other_speaker.name
                     self._living_topic.append_contradiction(ca, cb, current_speaker.name, other, turn_index)
                     self._resolution_store.add_contradiction(ca, cb, current_speaker.name, other, topic, turn_index)
                     self.graph.add_child(
-                        self._root_talking_point_id or "", "contradiction", f"{ca[:80]} ↔ {cb[:80]}"
+                        active_parent_id,
+                        "contradiction",
+                        f"{ca[:80]} ↔ {cb[:80]}",
+                        relation="contradicts",
+                        weight=0.92,
+                        evidence="explicit_contradict_signal",
+                        turn=turn_index,
                     )
                 for false_txt in falsehoods:
                     self._living_topic.append_falsehood(false_txt, current_speaker.name, turn_index)
                     self._resolution_store.add_falsehood(false_txt, current_speaker.name, topic, turn_index)
                     self.graph.add_child(
-                        self._root_talking_point_id or "", "falsehood", false_txt[:120]
+                        active_parent_id,
+                        "falsehood",
+                        false_txt[:120],
+                        relation="refutes",
+                        weight=0.96,
+                        evidence="explicit_false_signal",
+                        turn=turn_index,
+                    )
+                for prob in problems:
+                    self.graph.add_child(
+                        active_parent_id,
+                        "contradiction",
+                        f"PROBLEM: {prob[:108]}",
+                        relation="contradicts",
+                        weight=0.88,
+                        evidence="explicit_problem_signal",
+                        turn=turn_index,
+                    )
+
+                if runtime_conflict:
+                    self.graph.add_child(
+                        active_parent_id,
+                        "contradiction",
+                        f"Runtime/model conflict: {runtime_conflict[:96]}",
+                        relation="contradicts",
+                        weight=0.99,
+                        evidence="provider_runtime_error",
+                        turn=turn_index,
                     )
 
                 # -- Branch sub-topics --
@@ -487,16 +567,26 @@ class DebateOrchestrator:
                         self._root_talking_point_id or "",
                         "sub-topic",
                         sub,
+                        relation="elaborates",
+                        weight=0.70,
+                        evidence="sub_topic_branch",
+                        turn=turn_index,
                     )
                     self._emit("branch", {"sub_topic": sub, "parent": topic, "turn": turn_index})
 
                 # Add verified claims to graph as confirmed findings
                 for vc in verified_claims:
                     self.graph.add_child(
-                        self._root_talking_point_id or "", "conclusion", f"✔ {vc[:120]}"
+                        active_parent_id,
+                        "conclusion",
+                        f"✔ {vc[:120]}",
+                        relation="supports",
+                        weight=1.0,
+                        evidence="verified_claim",
+                        turn=turn_index,
                     )
 
-                if new_subs or conclusions or contradictions or falsehoods or verified_claims:
+                if new_subs or conclusions or contradictions or falsehoods or verified_claims or problems or runtime_conflict:
                     self._emit_graph()
 
                 # Rotate active talking point every few turns
@@ -625,7 +715,15 @@ class DebateOrchestrator:
                     note = f"Synthesis checkpoint at turn {turn_index}: compare strongest claims and unresolved assumptions."
                     self.shared_memory.add_synthesis(note)
                     if self._root_talking_point_id:
-                        self.graph.add_child(self._root_talking_point_id, "synthesis", note)
+                        self.graph.add_child(
+                            self._root_talking_point_id,
+                            "synthesis",
+                            note,
+                            relation="synthesizes",
+                            weight=0.78,
+                            evidence="arbiter_synthesis",
+                            turn=turn_index,
+                        )
                     self._emit_graph()
 
                 # -- Self-echo detection (fires only if arbiter is silent this turn) --

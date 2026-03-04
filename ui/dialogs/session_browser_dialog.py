@@ -6,8 +6,10 @@ Supports: view transcript, delete session, replay session transcript.
 from __future__ import annotations
 
 import json
+from html import escape
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
@@ -46,6 +48,14 @@ class SessionBrowserDialog(QDialog):
         self.setModal(False)
         self._apply_style()
         self._build_ui()
+        try:
+            self._sm.backfill_all_session_briefs()
+        except Exception:
+            pass
+        try:
+            self._sm.backfill_all_session_diagnostics()
+        except Exception:
+            pass
         self._refresh_list()
 
     # ------------------------------------------------------------------
@@ -196,26 +206,92 @@ class SessionBrowserDialog(QDialog):
                             for s in meta.sub_topics[:10])
         subs_block = f"<ul style='margin:0;padding-left:16px'>{subs_html}</ul>" if subs_html else "<em style='color:#546e7a'>none</em>"
 
+        score = self._sm.load_scoring_report(meta.session_id) or {}
+        winner = escape(str(score.get("winner", "—")))
+        margin = escape(str(score.get("margin", "—")))
+        reason = escape(str(score.get("reason", "")))
+        astra_avg = _fmt_score(score.get("astra_avg"))
+        nova_avg = _fmt_score(score.get("nova_avg"))
+
+        diagnostics = self._sm.load_session_diagnostics(meta.session_id)
+        if not isinstance(diagnostics, dict):
+            diagnostics = self._sm.build_session_diagnostics(meta.session_id, meta)
+        diag_generated = escape(str(diagnostics.get("generated_at", ""))) if isinstance(diagnostics, dict) else ""
+        diag_trigger = escape(str(diagnostics.get("trigger", ""))) if isinstance(diagnostics, dict) else ""
+        flow_line = (
+            f"public: {diagnostics.get('public_message_count', 0)}  ·  "
+            f"private: {diagnostics.get('private_thought_count', 0)}  ·  "
+            f"arbiter: {diagnostics.get('arbiter_count', 0)}  ·  "
+            f"graph nodes: {diagnostics.get('graph_nodes', 0)}"
+        )
+        left_fact_type_html = _fact_type_block(diagnostics.get("left_fact_types", {}))
+        right_fact_type_html = _fact_type_block(diagnostics.get("right_fact_types", {}))
+        issues_html = _issues_block(diagnostics.get("issues", []))
+
+        artifact_status = self._sm.get_session_artifact_status(meta.session_id)
+        core_artifacts = [
+            "session_meta.json",
+            "transcript.jsonl",
+            "astra_memory.json",
+            "nova_memory.json",
+            "graph.json",
+            "scoring_report.json",
+        ]
+        optional_artifacts = [
+            "session_diagnostics.json",
+            "session_brief.json",
+            "scoring_report.md",
+            "adaptive_prompts.json",
+            "ingested_dataset.json",
+            "uploads/",
+            "captures/",
+        ]
+        missing_core = [name for name in core_artifacts if not artifact_status.get(name, False)]
+        health_color = "#69f0ae" if not missing_core else "#ff5252"
+        health_text = "Complete" if not missing_core else f"Missing {len(missing_core)} core artifact(s)"
+        core_artifacts_html = "".join(_artifact_line(name, artifact_status.get(name, False)) for name in core_artifacts)
+        optional_artifacts_html = "".join(_artifact_line(name, artifact_status.get(name, False)) for name in optional_artifacts)
+
         # Load a few transcript lines for preview
-        transcript_preview = self._load_transcript_preview(meta.session_id)
+        transcript_preview = escape(self._load_transcript_preview(meta.session_id))
 
         return f"""
 <html><body style='background:#0a1018; color:#b0bec5; font-family:Segoe UI,sans-serif; font-size:12px; padding:6px'>
 <table width='100%' cellspacing='4'>
-  <tr><td style='color:#4dd0e1;width:30%'>Session ID</td><td style='color:#eceff1'>{meta.session_id}</td></tr>
+  <tr><td style='color:#4dd0e1;width:30%'>Session ID</td><td style='color:#eceff1'>{escape(meta.session_id)}</td></tr>
   <tr><td style='color:#4dd0e1'>Status</td><td style='color:{_status_color(meta.status)}'>{meta.status.upper()}</td></tr>
   <tr><td style='color:#4dd0e1'>Started</td><td>{start}</td></tr>
   <tr><td style='color:#4dd0e1'>Ended</td><td>{end}{duration}</td></tr>
   <tr><td style='color:#4dd0e1'>Models</td>
-      <td><span style='color:#00e5ff'>Astra: {meta.left_model}</span>  &nbsp;
-          <span style='color:#ff6e40'>Nova: {meta.right_model}</span></td></tr>
+      <td><span style='color:#00e5ff'>Astra: {escape(meta.left_model)}</span>  &nbsp;
+          <span style='color:#ff6e40'>Nova: {escape(meta.right_model)}</span></td></tr>
   <tr><td style='color:#4dd0e1'>Turns</td><td>{meta.turn_count}</td></tr>
   <tr><td style='color:#4dd0e1'>Facts</td>
-      <td><span style='color:#00e5ff'>{meta.left_agent}: {meta.left_facts}</span>  ·  
-          <span style='color:#ff6e40'>{meta.right_agent}: {meta.right_facts}</span></td></tr>
+      <td><span style='color:#00e5ff'>{escape(meta.left_agent)}: {meta.left_facts}</span>  ·  
+          <span style='color:#ff6e40'>{escape(meta.right_agent)}: {meta.right_facts}</span></td></tr>
   <tr><td style='color:#4dd0e1'>Truths</td><td style='color:#69f0ae'>✓ {meta.truths_count}</td></tr>
   <tr><td style='color:#4dd0e1'>Problems</td><td style='color:#ff5252'>✗ {meta.problems_count}</td></tr>
+  <tr><td style='color:#4dd0e1'>Winner</td><td style='color:#eceff1'>{winner} <span style='color:#546e7a'>({margin})</span></td></tr>
+  <tr><td style='color:#4dd0e1'>Score Avg</td><td><span style='color:#00e5ff'>Astra: {astra_avg}</span>  ·  <span style='color:#ff6e40'>Nova: {nova_avg}</span></td></tr>
+  <tr><td style='color:#4dd0e1'>Artifacts</td><td style='color:{health_color}'>{health_text}</td></tr>
 </table>
+<div style='margin:2px 0 8px 0; color:#90a4ae; font-size:11px;'>{reason}</div>
+<hr style='border:1px solid #1e2d42; margin:8px 0'>
+<p style='color:#4dd0e1; margin:4px 0'>Debate flow diagnostics</p>
+<div style='color:#90a4ae; font-size:11px; margin-bottom:6px;'>{flow_line}</div>
+<div style='color:#607d8b; font-size:10px; margin-bottom:6px;'>generated: {diag_generated or '—'}  ·  trigger: {diag_trigger or '—'}</div>
+<div style='display:flex; gap:24px; margin-bottom:4px;'>
+    <div><div style='color:#80cbc4; font-size:11px; margin-bottom:2px;'>Astra fact types</div>{left_fact_type_html}</div>
+    <div><div style='color:#ffab91; font-size:11px; margin-bottom:2px;'>Nova fact types</div>{right_fact_type_html}</div>
+</div>
+<p style='color:#4dd0e1; margin:4px 0'>Integrity checks</p>
+{issues_html}
+<hr style='border:1px solid #1e2d42; margin:8px 0'>
+<p style='color:#4dd0e1; margin:4px 0'>Artifact checklist</p>
+<div style='display:flex; gap:24px'>
+  <div><div style='color:#80cbc4; font-size:11px; margin-bottom:2px;'>Core</div>{core_artifacts_html}</div>
+  <div><div style='color:#607d8b; font-size:11px; margin-bottom:2px;'>Optional</div>{optional_artifacts_html}</div>
+</div>
 <hr style='border:1px solid #1e2d42; margin:8px 0'>
 <p style='color:#4dd0e1; margin:4px 0'>Sub-topics explored</p>
 {subs_block}
@@ -230,10 +306,20 @@ class SessionBrowserDialog(QDialog):
         lines: list[str] = []
         total = 0
         for ev in events:
-            if ev.get("event_type") == "public_message":
+            etype = ev.get("event_type")
+            if etype == "public_message":
                 p = ev.get("payload", {})
                 agent = p.get("agent", "?")
                 msg = str(p.get("message", ""))[:300]
+                line = f"[{agent}] {msg}"
+                lines.append(line)
+                total += len(line)
+                if total > max_chars:
+                    break
+            elif etype == "turn":
+                p = ev.get("payload", {})
+                agent = p.get("speaker", "?")
+                msg = str(p.get("text", ""))[:300]
                 line = f"[{agent}] {msg}"
                 lines.append(line)
                 total += len(line)
@@ -287,3 +373,41 @@ def _short_topic(topic: str, max_len: int = 55) -> str:
 
 def _status_color(status: str) -> str:
     return {"complete": "#69f0ae", "stopped": "#ffd740", "running": "#4dd0e1"}.get(status, "#90a4ae")
+
+
+def _fmt_score(value: Any) -> str:
+    try:
+        return f"{float(value):.3f}"
+    except Exception:
+        return "—"
+
+
+def _artifact_line(name: str, exists: bool) -> str:
+    icon = "✓" if exists else "✗"
+    color = "#69f0ae" if exists else "#ef5350"
+    return f"<div style='color:{color}; font-size:11px;'>{icon} {escape(name)}</div>"
+
+
+def _fact_type_block(fact_types: object) -> str:
+    if not isinstance(fact_types, dict) or not fact_types:
+        return "<div style='color:#546e7a; font-size:11px;'>none</div>"
+
+    parts: list[str] = []
+    for key in sorted(fact_types):
+        try:
+            val = int(fact_types[key])
+        except Exception:
+            continue
+        parts.append(f"<div style='color:#90a4ae; font-size:11px;'>• {escape(str(key))}: {val}</div>")
+    return "".join(parts) or "<div style='color:#546e7a; font-size:11px;'>none</div>"
+
+
+def _issues_block(issues: object) -> str:
+    if not isinstance(issues, list) or not issues:
+        return "<div style='color:#69f0ae; font-size:11px;'>✓ No integrity issues detected</div>"
+
+    rendered = "".join(
+        f"<div style='color:#ef5350; font-size:11px;'>✗ {escape(str(msg))}</div>"
+        for msg in issues
+    )
+    return rendered or "<div style='color:#69f0ae; font-size:11px;'>✓ No integrity issues detected</div>"

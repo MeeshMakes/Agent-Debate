@@ -2,15 +2,16 @@
 
 Layout
 ------
-  4 fixed columns, one per node type:
+    Semantic columns, one per node family:
     Col 0 – Root Topic   (#00e5ff)
     Col 1 – Sub-topic    (#ffd740)
-    Col 2 – Synthesis    (#69f0ae)
-    Col 3 – Branch       (#ce93d8)
+        Col 2 – Evidence     (#69f0ae)
+        Col 3 – Conflict     (#ef5350)
+        Col 4 – Synthesis    (#ce93d8)
 
   Every node occupies a card positioned in its type's column.
   Creation order drives vertical position within that column.
-  Bézier curves connect parents to their children.
+    Bézier curves connect semantic edges (supports / contradicts / refutes / synthesizes).
 
 Interaction
 -----------
@@ -30,10 +31,23 @@ from PyQt6.QtWidgets import (
 
 # ------------------------------------------------------------------ layout constants
 
-_COL_TYPES  = ["talking_point", "sub-topic", "synthesis", "branch"]
-_COL_LABELS = ["◈  Root Topic", "◉  Sub-Topic", "◆  Synthesis", "◎  Branch"]
-_COL_COLORS = ["#00e5ff",       "#ffd740",       "#69f0ae",      "#ce93d8"]
-_COL_BG     = ["#0d2a3a",       "#2a1f00",       "#082a14",      "#1a0a2a"]
+_TYPE_ALIAS: dict[str, str] = {
+    "branch": "sub-topic",
+    "falsehood": "contradiction",
+}
+
+_COL_TYPES  = ["talking_point", "sub-topic", "conclusion", "contradiction", "synthesis"]
+_COL_LABELS = ["◈  Root Topic", "◉  Sub-Topic", "✔  Evidence", "⚠  Conflict", "◆  Synthesis"]
+_COL_COLORS = ["#00e5ff",       "#ffd740",      "#69f0ae",     "#ef5350",     "#ce93d8"]
+_COL_BG     = ["#0d2a3a",       "#2a1f00",      "#082a14",     "#2a0c12",     "#1a0a2a"]
+
+_EDGE_RELATION_STYLE: dict[str, tuple[str, Qt.PenStyle]] = {
+    "supports": ("#69f0ae", Qt.PenStyle.SolidLine),
+    "elaborates": ("#4dd0e1", Qt.PenStyle.SolidLine),
+    "contradicts": ("#ffd740", Qt.PenStyle.DashLine),
+    "refutes": ("#ef5350", Qt.PenStyle.DashLine),
+    "synthesizes": ("#ce93d8", Qt.PenStyle.DotLine),
+}
 
 CARD_W    = 230
 CARD_H    = 72
@@ -56,7 +70,8 @@ class _NodeCard(QGraphicsItem):
         self.status    = status
         self.order     = order
 
-        col_idx       = _COL_TYPES.index(node_type) if node_type in _COL_TYPES else 0
+        canon_type    = _canonical_type(node_type)
+        col_idx       = _COL_TYPES.index(canon_type) if canon_type in _COL_TYPES else 0
         self.col_idx  = col_idx
         self.color    = _COL_COLORS[col_idx]
         self.bg_color = _COL_BG[col_idx]
@@ -150,14 +165,17 @@ class _NodeCard(QGraphicsItem):
 class _EdgeItem(QGraphicsPathItem):
     """Smooth Bézier curve connecting two node cards."""
 
-    def __init__(self, src: QPointF, dst: QPointF, color: str) -> None:
+    def __init__(self, src: QPointF, dst: QPointF, relation: str, weight: float = 0.5) -> None:
         path = QPainterPath(src)
         cx   = (src.x() + dst.x()) / 2
         path.cubicTo(QPointF(cx, src.y()), QPointF(cx, dst.y()), dst)
         super().__init__(path)
+        rel = (relation or "elaborates").strip().lower()
+        color, style = _EDGE_RELATION_STYLE.get(rel, ("#607d8b", Qt.PenStyle.SolidLine))
         c = QColor(color)
         c.setAlpha(130)
-        self.setPen(QPen(c, 1.4, Qt.PenStyle.SolidLine,
+        width = 1.2 + (max(0.0, min(1.0, float(weight))) * 1.6)
+        self.setPen(QPen(c, width, style,
                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         self.setZValue(-1)
 
@@ -234,10 +252,11 @@ class GraphPanel(QWidget):
         """Accepts simple (type, label, status) tuples — no parent info."""
         self._scene.clear()
         self._draw_column_headers()
-        col_counts = [0, 0, 0, 0]
+        col_counts = [0 for _ in _COL_TYPES]
         for i, (ntype, label, status) in enumerate(rows):
-            col = _COL_TYPES.index(ntype) if ntype in _COL_TYPES else 0
-            card = _NodeCard("", ntype, label, status, i + 1)
+            canon = _canonical_type(ntype)
+            col = _COL_TYPES.index(canon) if canon in _COL_TYPES else 0
+            card = _NodeCard("", canon, label, status, i + 1)
             card.setPos(col * COL_GAP, HEADER_H + col_counts[col] * ROW_H)
             col_counts[col] += 1
             self._scene.addItem(card)
@@ -245,41 +264,87 @@ class GraphPanel(QWidget):
 
     def set_tree_nodes(self, nodes) -> None:
         """Accepts DebateNode list from manager.as_tree_nodes()."""
+        tree = [
+            {
+                "node_id": n.node_id,
+                "type": n.node_type,
+                "label": n.label,
+                "status": n.status,
+                "parent_id": n.parent_id,
+                "order": n.creation_order,
+            }
+            for n in nodes
+        ]
+        self.set_graph(tree, edges=None)
+
+    def set_graph(self, tree: list[dict], edges: list[dict] | None = None) -> None:
+        """Render graph from rich node list + optional explicit semantic edges."""
         self._scene.clear()
         self._draw_column_headers()
         id_to_card: dict[str, _NodeCard] = {}
-        col_counts   = [0, 0, 0, 0]
-        sorted_nodes = sorted(nodes, key=lambda n: n.creation_order)
+        col_counts = [0 for _ in _COL_TYPES]
 
-        # Place cards in their columns
+        sorted_nodes = sorted(tree, key=lambda d: int(d.get("order", 0) or 0))
         for node in sorted_nodes:
-            col  = _COL_TYPES.index(node.node_type) if node.node_type in _COL_TYPES else 0
+            ntype = str(node.get("type", "talking_point"))
+            canon = _canonical_type(ntype)
+            col = _COL_TYPES.index(canon) if canon in _COL_TYPES else 0
             card = _NodeCard(
-                node.node_id, node.node_type, node.label,
-                node.status, node.creation_order,
+                str(node.get("node_id", "")),
+                canon,
+                str(node.get("label", "")),
+                str(node.get("status", "active")),
+                int(node.get("order", 0) or 0),
             )
             card.setPos(col * COL_GAP, HEADER_H + col_counts[col] * ROW_H)
             col_counts[col] += 1
             self._scene.addItem(card)
-            id_to_card[node.node_id] = card
+            node_id = str(node.get("node_id", ""))
+            if node_id:
+                id_to_card[node_id] = card
 
-        # Draw edges parent → child
-        for node in sorted_nodes:
-            if not node.parent_id or node.parent_id not in id_to_card:
-                continue
-            p = id_to_card[node.parent_id]
-            c = id_to_card[node.node_id]
-            # Route right→left when child is in a later column; bottom→top otherwise
-            if p.col_idx < c.col_idx:
-                src, dst = p.center_right(), c.center_left()
-            else:
-                src, dst = p.center_bottom(), c.center_top()
-            self._scene.addItem(_EdgeItem(src, dst, _COL_COLORS[c.col_idx]))
+        if edges:
+            sorted_edges = sorted(edges, key=lambda e: int(e.get("order", 0) or 0))
+            for edge in sorted_edges:
+                src_id = str(edge.get("source_id", ""))
+                dst_id = str(edge.get("target_id", ""))
+                if src_id not in id_to_card or dst_id not in id_to_card:
+                    continue
+                p = id_to_card[src_id]
+                c = id_to_card[dst_id]
+                if p.col_idx < c.col_idx:
+                    src, dst = p.center_right(), c.center_left()
+                else:
+                    src, dst = p.center_bottom(), c.center_top()
+                self._scene.addItem(
+                    _EdgeItem(
+                        src,
+                        dst,
+                        relation=str(edge.get("relation", "elaborates")),
+                        weight=float(edge.get("weight", 0.5) or 0.5),
+                    )
+                )
+        else:
+            for node in sorted_nodes:
+                parent_id = str(node.get("parent_id", ""))
+                node_id = str(node.get("node_id", ""))
+                if not parent_id or parent_id not in id_to_card or node_id not in id_to_card:
+                    continue
+                p = id_to_card[parent_id]
+                c = id_to_card[node_id]
+                if p.col_idx < c.col_idx:
+                    src, dst = p.center_right(), c.center_left()
+                else:
+                    src, dst = p.center_bottom(), c.center_top()
+                self._scene.addItem(_EdgeItem(src, dst, relation="elaborates", weight=0.5))
 
         self._fit_scene()
 
-    def set_rows_rich(self, tree: list[dict]) -> None:
-        """Accepts list of {'type','label','status','depth','order'} dicts (compat)."""
+    def set_rows_rich(self, tree: list[dict], edges: list[dict] | None = None) -> None:
+        """Accepts rich node dicts and optional edge dicts from orchestrator payload."""
+        if tree and isinstance(tree[0], dict) and "node_id" in tree[0]:
+            self.set_graph(tree, edges=edges)
+            return
         self.set_rows([(d["type"], d["label"], d["status"]) for d in tree])
 
     def clear_rows(self) -> None:
@@ -303,3 +368,8 @@ class GraphPanel(QWidget):
             event.accept()
         else:
             super().wheelEvent(event)
+
+
+def _canonical_type(node_type: str) -> str:
+    key = (node_type or "").strip().lower()
+    return _TYPE_ALIAS.get(key, key)

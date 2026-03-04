@@ -40,6 +40,7 @@ from config.model_prefs import (
     load_model_prefs,
     save_model_prefs,
 )
+from config.topic_prefs import load_topic_prefs, save_topic_prefs
 from agents.topic_refine_worker import TopicRefineWorker
 from config.starter_topics import STARTER_TOPICS
 from core.orchestrator import DebateEvent, DebateOrchestrator
@@ -81,6 +82,15 @@ _KNOWN_CLOUD_MODELS = {
 }
 
 
+def _strict_local_only() -> bool:
+    val = os.getenv("AGENT_DEBATE_STRICT_LOCAL_ONLY", "1").strip().lower()
+    return val not in {"0", "false", "no"}
+
+
+def _set_strict_local_only(enabled: bool) -> None:
+    os.environ["AGENT_DEBATE_STRICT_LOCAL_ONLY"] = "1" if enabled else "0"
+
+
 def _is_cloud_model(name: str) -> bool:
     """Return True if the model name/tag indicates an Ollama cloud model.
 
@@ -104,6 +114,13 @@ def _is_cloud_model(name: str) -> bool:
 def _clean_model_name(text: str) -> str:
     """Strip the ☁/💻/◈ display prefixes from combo item text to get the raw model name."""
     return text.replace("☁", "").replace("💻", "").replace("◈", "").strip()
+
+
+def _sanitize_local_model(selected: str, fallback: str) -> str:
+    model = (selected or "").strip() or fallback
+    if _strict_local_only() and _is_cloud_model(model):
+        return fallback
+    return model
 
 
 class _NoWheelSlider(QSlider):
@@ -391,6 +408,75 @@ class DebateWorker(QThread):
         self.done_signal.emit()
 
 
+class _RepoWatchdogPollWorker(QThread):
+    polled = pyqtSignal(dict)
+
+    def __init__(
+        self,
+        watchdog: RepoWatchdog,
+        repo_path: str,
+        last_signature: str,
+        epoch: int,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._watchdog = watchdog
+        self._repo_path = repo_path
+        self._last_signature = last_signature
+        self._epoch = epoch
+
+    def run(self) -> None:
+        payload: dict = {
+            "epoch": self._epoch,
+            "repo_path": self._repo_path,
+            "has_changes": False,
+            "signature": self._last_signature,
+            "short_msg": "",
+            "change_brief": "",
+        }
+
+        try:
+            changes = self._watchdog.check_for_changes(self._repo_path)
+        except Exception as exc:
+            payload["error"] = str(exc)
+            self.polled.emit(payload)
+            return
+
+        if not changes.has_changes:
+            self.polled.emit(payload)
+            return
+
+        signature = json.dumps(
+            {"a": changes.added[:12], "m": changes.modified[:12], "d": changes.deleted[:12]},
+            sort_keys=True,
+        )
+        payload["signature"] = signature
+        if signature == self._last_signature:
+            self.polled.emit(payload)
+            return
+
+        payload["has_changes"] = True
+
+        try:
+            report = self._watchdog.update_docs_for_changes(self._repo_path, changes)
+            payload["change_brief"] = self._watchdog.build_change_brief(changes, report)
+        except Exception:
+            payload["change_brief"] = "Repository changes detected, but incremental docs refresh failed."
+
+        added = changes.added[:3]
+        modified = changes.modified[:3]
+        deleted = changes.deleted[:3]
+        lines: list[str] = []
+        if added:
+            lines.append("Added: " + ", ".join(added))
+        if modified:
+            lines.append("Modified: " + ", ".join(modified))
+        if deleted:
+            lines.append("Deleted: " + ", ".join(deleted))
+        payload["short_msg"] = " | ".join(lines)
+        self.polled.emit(payload)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, project_root: Path) -> None:
         super().__init__()
@@ -400,6 +486,7 @@ class MainWindow(QMainWindow):
 
         # Load saved model preferences
         self._model_prefs = load_model_prefs()
+        self._topic_prefs = load_topic_prefs()
         # VS Code bridge model IDs discovered at last populate (must exist before build_orchestrator)
         self._vscode_model_ids: set[str] = set()
 
@@ -414,8 +501,8 @@ class MainWindow(QMainWindow):
         self._tts_worker: TTSPlaybackWorker | None = None
         self._current_speaking_idx: int = -1
         # Topic state — set by TopicPickerDialog
-        self._current_topic_title: str = STARTER_TOPICS[0].title
-        self._current_topic_context: str = ""   # full brief fed to agents
+        self._current_topic_title: str = str(self._topic_prefs.get("title") or STARTER_TOPICS[0].title)
+        self._current_topic_context: str = str(self._topic_prefs.get("context") or "")   # full brief fed to agents
         self._pending_ingest_files: list[str] = []
         self._ingest_worker: IngestionWorker | None = None
         self._session_browser: SessionBrowserDialog | None = None
@@ -427,21 +514,26 @@ class MainWindow(QMainWindow):
         self._pending_right_model: str | None = None
         # Cloud model usage counter for current session
         self._cloud_calls: int = 0
+        self._cloud_models_enabled: bool = not _strict_local_only()
         # TTS word-tracking for Capture Segment
         self._current_tts_msg_idx: int = -1
         self._current_tts_char_offset: int = 0
         self._capture_seq: int = 0
         # Talking-point key (set from TopicPickerDialog) — tags each new session
-        self._current_tp_key: str = ""
+        self._current_tp_key: str = str(self._topic_prefs.get("tp_key") or "")
         # Latest resolution payload — used to feed TopicRefineWorker after debate ends
         self._last_resolution_payload: dict = {}
         self._refine_worker: TopicRefineWorker | None = None
-        self._repo_watchdog_meta: dict | None = None
+        self._refine_source_session_id: str = ""
+        saved_repo_meta = self._topic_prefs.get("repo_watchdog_meta")
+        self._repo_watchdog_meta: dict | None = saved_repo_meta if isinstance(saved_repo_meta, dict) else None
         self._repo_watchdog_last_sig: str = ""
         self._repo_watchdog = RepoWatchdog(get_session_manager().root)
         self._repo_watchdog_timer = QTimer(self)
         self._repo_watchdog_timer.setInterval(12000)
         self._repo_watchdog_timer.timeout.connect(self._poll_repo_watchdog)
+        self._repo_watchdog_worker: _RepoWatchdogPollWorker | None = None
+        self._repo_watchdog_epoch: int = 0
 
         # -- panels --
         self.left_panel = LeftAgentPanel()
@@ -456,6 +548,7 @@ class MainWindow(QMainWindow):
 
         self._build_layout()
         self._build_toolbar()
+        self._sync_cloud_toggle_ui()
         self._bind_events()
         self._set_debate_transport_state("stopped")
         self.center_panel.set_source_click_handler(self.open_source_dialog)
@@ -551,22 +644,21 @@ class MainWindow(QMainWindow):
         stats_lay.addStretch()
 
 
-        # Cloud usage counter — increments each time a cloud model speaks
+        # Local runtime mode badge
         _cloud_sep = QFrame()
         _cloud_sep.setFrameShape(QFrame.Shape.VLine)
         _cloud_sep.setStyleSheet("color: #1a3a55;")
-        self._cloud_calls_lbl = QLabel("☁ 0 cloud calls")
+        self._cloud_calls_lbl = QLabel("💻 local-only")
         self._cloud_calls_lbl.setObjectName("cloudCallsLbl")
         self._cloud_calls_lbl.setStyleSheet(
-            "color: #546e7a; font-size: 9pt; font-weight: 600;"
+            "color: #80cbc4; font-size: 9pt; font-weight: 700;"
         )
         self._cloud_calls_lbl.setToolTip(
-            "Number of responses generated by Ollama cloud models this session.\n"
-            "Cloud models count against your Ollama plan usage limits.\n"
-            "Free tier: light usage  |  Pro $20/mo  |  Max $100/mo"
+            "Strict local mode: cloud-tagged models are blocked; all calls stay on localhost:11434"
         )
         stats_lay.addWidget(_cloud_sep)
         stats_lay.addWidget(self._cloud_calls_lbl)
+        self._refresh_cloud_mode_label()
 
         # Grounding pass progress indicator (hidden until a grounding pass runs)
         _grnd_sep = QFrame()
@@ -634,20 +726,27 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(6, 4, 6, 4)
         row.setSpacing(8)
 
-        # Topic picker button — opens full rich pop-out dialog
-        self._topic_btn = QPushButton()
+        # Debate Studio button + current selection label
+        self._topic_btn = QPushButton("🧠 Debate Studio")
         self._topic_btn.setObjectName("topicPickerBtn")
-        self._topic_btn.setMinimumWidth(320)
-        self._topic_btn.setMaximumWidth(520)
+        self._topic_btn.setMinimumWidth(160)
+        self._topic_btn.setMaximumWidth(200)
         self._topic_btn.setStyleSheet(
             "QPushButton#topicPickerBtn { background: #0d1e30; color: #00e5ff;"
             " font-weight: 700; font-size: 12px; border-radius: 8px;"
-            " padding: 7px 14px; border: 1px solid #1a3a55;"
-            " text-align: left; }"
+            " padding: 7px 14px; border: 1px solid #1a3a55; }"
             "QPushButton#topicPickerBtn:hover { background: #112640;"
             " border-color: #00acc1; }"
         )
-        self._topic_btn.setToolTip("Click to choose or configure the debate topic")
+        self._topic_btn.setToolTip("Open Debate Studio")
+        self._topic_name_lbl = QLabel("")
+        self._topic_name_lbl.setObjectName("currentDebateLabel")
+        self._topic_name_lbl.setMinimumWidth(280)
+        self._topic_name_lbl.setMaximumWidth(560)
+        self._topic_name_lbl.setStyleSheet(
+            "QLabel#currentDebateLabel { color: #90a4ae; font-size: 10.5pt;"
+            " font-style: italic; padding-left: 4px; }"
+        )
         self._refresh_topic_button()
 
         # ---- Per-agent model selectors ----
@@ -672,11 +771,25 @@ class MainWindow(QMainWindow):
         self._nova_model_combo.setToolTip("Ollama model used by Nova (right agent)")
         self._nova_model_combo.addItem(self._model_prefs["right_model"])
 
+        self._cloud_toggle_btn = QPushButton("☁  Cloud Models OFF")
+        self._cloud_toggle_btn.setObjectName("cloudModelsToggleBtn")
+        self._cloud_toggle_btn.setCheckable(True)
+        self._cloud_toggle_btn.setChecked(self._cloud_models_enabled)
+        self._cloud_toggle_btn.setToolTip(
+            "Enable cloud-tagged Ollama models in the dropdowns and refresh model lists"
+        )
+        self._cloud_toggle_btn.setStyleSheet(
+            "QPushButton { background: #1a2840; color: #90a4ae; border-radius: 6px;"
+            " padding: 6px 10px; border: 1px solid #2a3a55; font-weight: 700; }"
+            "QPushButton:hover { background: #1e3a5f; color: #fff; }"
+            "QPushButton:checked { background: #3a2455; color: #e1bee7; border-color: #ce93d8; }"
+        )
+
         # Ollama info / pricing button
         self._ollama_info_btn = QPushButton("?")
         self._ollama_info_btn.setObjectName("ollamaInfoBtn")
         self._ollama_info_btn.setFixedSize(22, 22)
-        self._ollama_info_btn.setToolTip("Ollama API info, cloud model pricing & session usage")
+        self._ollama_info_btn.setToolTip("Ollama local runtime info and troubleshooting")
         self._ollama_info_btn.setStyleSheet(
             "QPushButton { background: #1a2840; color: #546e7a; border-radius: 11px;"
             " border: 1px solid #2a3a55; font-weight: 700; font-size: 10pt; }"
@@ -736,11 +849,11 @@ class MainWindow(QMainWindow):
         self._endless_check = QCheckBox("Endless")
         self._endless_check.setObjectName("endlessCheck")
         self._endless_check.setStyleSheet("color: #ffd740; font-weight: 600;")
-        self._endless_check.setToolTip("Agents debate forever — never stops until you press Stop")
+        self._endless_check.setToolTip("Agents debate forever — never stops until you press Stop Debate")
         self._endless_check.toggled.connect(self._on_endless_toggled)
 
         # Debate control buttons
-        self.start_button = QPushButton("▶  Start")
+        self.start_button = QPushButton("▶  Start Debate")
         self.start_button.setObjectName("startButton")
         self.start_button.setStyleSheet(
             "QPushButton { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
@@ -751,7 +864,7 @@ class MainWindow(QMainWindow):
             "QPushButton:disabled { background: #102226; color: #4f6a6f; border: 1px solid #1d3a3f; }"
         )
 
-        self.stop_button = QPushButton("■  Stop")
+        self.stop_button = QPushButton("■  Stop Debate")
         self.stop_button.setObjectName("stopButton")
         self.stop_button.setStyleSheet(
             "QPushButton { background: qlineargradient(x1:0,y1:0,x2:0,y2:1,"
@@ -761,7 +874,7 @@ class MainWindow(QMainWindow):
             "QPushButton:disabled { background: #2a1212; color: #7a5555; border: 1px solid #4a2020; }"
         )
 
-        self._debate_pause_btn = QPushButton("⏸  Pause")
+        self._debate_pause_btn = QPushButton("⏸  Pause Debate")
         self._debate_pause_btn.setObjectName("debatePauseBtn")
         self._debate_pause_btn.setCheckable(True)
         self._debate_pause_btn.setStyleSheet(
@@ -829,11 +942,13 @@ class MainWindow(QMainWindow):
         self._speed_slider.valueChanged.connect(self._on_speed_changed)
 
         row.addWidget(self._topic_btn)
+        row.addWidget(self._topic_name_lbl)
         row.addWidget(sep0)
         row.addWidget(astra_model_label)
         row.addWidget(self._astra_model_combo)
         row.addWidget(nova_model_label)
         row.addWidget(self._nova_model_combo)
+        row.addWidget(self._cloud_toggle_btn)
         row.addWidget(self._ollama_info_btn)
         row.addWidget(model_sep)
         row.addWidget(turns_label)
@@ -942,11 +1057,43 @@ class MainWindow(QMainWindow):
         # Model combo saves
         self._astra_model_combo.currentTextChanged.connect(self._on_model_changed)
         self._nova_model_combo.currentTextChanged.connect(self._on_model_changed)
+        self._cloud_toggle_btn.toggled.connect(self._on_cloud_models_toggled)
         # Session / semantic buttons
         self._sessions_btn.clicked.connect(self._open_session_browser)
         self._open_folder_btn.clicked.connect(self._open_session_folder)
         self._semantic_btn.toggled.connect(self._on_semantic_toggled)
         self._analytics_btn.clicked.connect(self._open_analytics_dialog)
+
+    def _sync_cloud_toggle_ui(self) -> None:
+        enabled = self._cloud_models_enabled
+        self._cloud_toggle_btn.blockSignals(True)
+        self._cloud_toggle_btn.setChecked(enabled)
+        self._cloud_toggle_btn.setText("☁  Cloud Models ON" if enabled else "☁  Cloud Models OFF")
+        self._cloud_toggle_btn.blockSignals(False)
+
+    def _refresh_cloud_mode_label(self) -> None:
+        if self._cloud_models_enabled:
+            self._cloud_calls_lbl.setText("☁ cloud-enabled")
+            self._cloud_calls_lbl.setStyleSheet("color: #ce93d8; font-size: 9pt; font-weight: 700;")
+            self._cloud_calls_lbl.setToolTip(
+                "Cloud model selection is enabled. Local models remain available in separate sections."
+            )
+        else:
+            self._cloud_calls_lbl.setText("💻 local-only")
+            self._cloud_calls_lbl.setStyleSheet("color: #80cbc4; font-size: 9pt; font-weight: 700;")
+            self._cloud_calls_lbl.setToolTip(
+                "Strict local mode: cloud-tagged models are blocked; all calls stay on localhost:11434"
+            )
+
+    def _on_cloud_models_toggled(self, checked: bool) -> None:
+        self._cloud_models_enabled = bool(checked)
+        _set_strict_local_only(not self._cloud_models_enabled)
+        self._sync_cloud_toggle_ui()
+        self._refresh_cloud_mode_label()
+        self._populate_model_combos()
+        self._on_model_changed()
+        mode_msg = "Cloud models enabled — dropdowns refreshed" if self._cloud_models_enabled else "Cloud models disabled — local-only mode restored"
+        self._status_bar.showMessage(mode_msg, 4000)
 
     def _set_debate_transport_state(self, state: str) -> None:
         """Update Start/Stop/Pause button enabled + label state.
@@ -960,7 +1107,7 @@ class MainWindow(QMainWindow):
             self._debate_pause_btn.blockSignals(True)
             self._debate_pause_btn.setChecked(False)
             self._debate_pause_btn.blockSignals(False)
-            self._debate_pause_btn.setText("⏸  Pause")
+            self._debate_pause_btn.setText("⏸  Pause Debate")
             return
 
         self.start_button.setEnabled(False)
@@ -971,25 +1118,37 @@ class MainWindow(QMainWindow):
             self._debate_pause_btn.blockSignals(True)
             self._debate_pause_btn.setChecked(True)
             self._debate_pause_btn.blockSignals(False)
-            self._debate_pause_btn.setText("▶  Resume")
+            self._debate_pause_btn.setText("▶  Resume Debate")
         elif state == "pausing":
             self._debate_pause_btn.blockSignals(True)
             self._debate_pause_btn.setChecked(True)
             self._debate_pause_btn.blockSignals(False)
-            self._debate_pause_btn.setText("⏳  Pausing…")
+            self._debate_pause_btn.setText("⏳  Pausing Debate…")
         else:
             self._debate_pause_btn.blockSignals(True)
             self._debate_pause_btn.setChecked(False)
             self._debate_pause_btn.blockSignals(False)
-            self._debate_pause_btn.setText("⏸  Pause")
+            self._debate_pause_btn.setText("⏸  Pause Debate")
 
     def _refresh_topic_button(self) -> None:
-        """Update the topic button label to show current selection."""
+        """Update current debate label shown beside the Debate Studio button."""
         label = self._current_topic_title
         if len(label) > 62:
             label = label[:59] + "…"
         files_hint = f"  · {len(self._pending_ingest_files)} file(s)" if self._pending_ingest_files else ""
-        self._topic_btn.setText(f"🎯  {label}{files_hint}")
+        self._topic_btn.setText("🧠 Debate Studio")
+        self._topic_name_lbl.setText(f"Current debate: {label}{files_hint}")
+
+    def _save_topic_selection(self) -> None:
+        try:
+            save_topic_prefs(
+                title=self._current_topic_title,
+                context=self._current_topic_context,
+                tp_key=self._current_tp_key,
+                repo_watchdog_meta=self._repo_watchdog_meta,
+            )
+        except Exception:
+            pass
 
     def _open_topic_picker(self) -> None:
         from PyQt6.QtWidgets import QDialog
@@ -999,6 +1158,7 @@ class MainWindow(QMainWindow):
         # Capture the talking-point key after the dialog closes
         if dlg.result() == QDialog.DialogCode.Accepted:
             self._current_tp_key = dlg.tp_key
+            self._save_topic_selection()
 
     def _on_topic_confirmed(self, title: str, full_context: str, files: list) -> None:
         clean_context, repo_meta = self._extract_repo_watchdog_meta(full_context)
@@ -1007,10 +1167,36 @@ class MainWindow(QMainWindow):
         self._repo_watchdog_meta = repo_meta
         self._repo_watchdog_last_sig = ""
         self._pending_ingest_files = files
+        self._save_topic_selection()
         self._refresh_topic_button()
+        self._clear_debate_workspace_for_topic_jump()
         file_hint = f"  +  {len(files)} file(s) queued for ingestion" if files else ""
         repo_hint = "  · repo watchdog linked" if repo_meta else ""
         self._status_bar.showMessage(f"Topic set: {title[:80]}{file_hint}{repo_hint}")
+
+    def _clear_debate_workspace_for_topic_jump(self) -> None:
+        """Clear visible artifacts from the previous run after Debate Studio navigation.
+
+        This supports the expected workflow where selecting "Go to Session N" should
+        present a clean main UI before the next debate starts.
+        """
+        if self.worker is not None and self.worker.isRunning():
+            return
+
+        self.left_panel.private_view.clear()
+        self.right_panel.private_view.clear()
+        self.center_panel.clear_messages()
+        self.arbiter_panel.set_message("Arbiter watching...")
+        self.arbiter_panel.set_paused_state(False)
+        self.arbiter_panel.clear_staging()
+        self.graph_panel.clear_rows()
+        self._continue_btn.setVisible(False)
+        self._set_debate_transport_state("stopped")
+        self.start_button.setText("🔄  New Debate")
+        self._current_tts_msg_idx = -1
+        self._current_tts_char_offset = 0
+        self.scoring_panel.new_session("")
+        self._update_stats_bar({}, 0)
 
     def _load_repo_dataset_into_orchestrator(self) -> bool:
         if self.orchestrator is None or not self._repo_watchdog_meta:
@@ -1020,12 +1206,6 @@ class MainWindow(QMainWindow):
             return False
 
         data = self._repo_watchdog.load_semantic_dataset(repo_path)
-        if not data:
-            try:
-                self._repo_watchdog.build_snapshot(repo_path)
-                data = self._repo_watchdog.load_semantic_dataset(repo_path)
-            except Exception:
-                data = None
         if not data:
             return False
 
@@ -1076,8 +1256,14 @@ class MainWindow(QMainWindow):
     def _on_model_changed(self, _text: str = "") -> None:
         """Persist model selections whenever either combo changes.
         If a debate is running, queue the swap to apply at the next pair boundary."""
-        left = _clean_model_name(self._astra_model_combo.currentText())
-        right = _clean_model_name(self._nova_model_combo.currentText())
+        left = _sanitize_local_model(
+            _clean_model_name(self._astra_model_combo.currentText()),
+            DEFAULT_LEFT_MODEL,
+        )
+        right = _sanitize_local_model(
+            _clean_model_name(self._nova_model_combo.currentText()),
+            DEFAULT_RIGHT_MODEL,
+        )
         if not (left and right):
             return
         self._model_prefs = {"left_model": left, "right_model": right}
@@ -1112,9 +1298,9 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage(f"Models saved — Astra: {left}  Nova: {right}", 3000)
 
     def _show_ollama_info_dialog(self) -> None:
-        """Show Ollama API info, cloud model pricing, and current session cloud usage."""
+        """Show local Ollama runtime info and troubleshooting guidance."""
         dialog = QDialog(self)
-        dialog.setWindowTitle("Ollama Cloud Info")
+        dialog.setWindowTitle("Ollama Local Runtime Info")
         dialog.setMinimumWidth(480)
         dialog.setStyleSheet(
             "QDialog { background: #07111c; color: #e0e0e0; }"
@@ -1152,50 +1338,26 @@ class MainWindow(QMainWindow):
                 "Create this file and paste your Ollama API key into it."
             ))
 
-        # --- Pricing ---
-        layout.addWidget(_section("💰  Cloud Pricing (ollama.com/pricing)", "#ffd740"))
-        layout.addWidget(_row(
-            "▸  Free  — $0/mo  Light usage: chat, quick questions, trying models"
-        ))
-        layout.addWidget(_row(
-            "▸  Pro   — $20/mo  Day-to-day: RAG, document analysis, coding tasks"
-        ))
-        layout.addWidget(_row(
-            "▸  Max  — $100/mo  Heavy sustained: coding agents, batch processing"
-        ))
-        layout.addWidget(_row(
-            "Pricing is subscription-based (not per-token). \n"
-            "Usage limits apply by plan. Local models are always unlimited."
-        ))
+        # --- Runtime mode ---
+        layout.addWidget(_section("💻  Runtime Mode", "#80cbc4"))
+        if _strict_local_only():
+            layout.addWidget(_row("Strict local mode is enabled. Cloud-tagged models are blocked."))
+        else:
+            layout.addWidget(_row("Cloud model selection is enabled. Local and cloud models are both available."))
 
-        # --- Session Usage ---
-        layout.addWidget(_section("☁  This Session", "#4dd0e1"))
-        cloud_count = self._cloud_calls
+        # --- Current models ---
+        layout.addWidget(_section("🧠  Current Models", "#4dd0e1"))
         lm = _clean_model_name(self._astra_model_combo.currentText()) or "(none)"
         rm = _clean_model_name(self._nova_model_combo.currentText()) or "(none)"
-        layout.addWidget(_row(
-            f"Cloud responses generated: {cloud_count}\n"
-            f"Astra model: {lm}  (☁ cloud) " if _is_cloud_model(lm) else
-            f"Cloud responses generated: {cloud_count}\n"
-            f"Astra model: {lm}  (local)"
-        ))
-        layout.addWidget(_row(
-            f"Nova model: {rm}  (☁ cloud)" if _is_cloud_model(rm)
-            else f"Nova model: {rm}  (local)"
-        ))
-        layout.addWidget(_row(
-            "View full usage at: ollama.com → Account → Usage"
-        ))
+        layout.addWidget(_row(f"Astra model: {lm} (local)"))
+        layout.addWidget(_row(f"Nova model: {rm} (local)"))
 
-        # --- Known cloud models ---
-        layout.addWidget(_section("📌  Known Cloud Models", "#90a4ae"))
-        cloud_list = ", ".join(sorted(_KNOWN_CLOUD_MODELS))
-        cloud_lbl = QLabel(cloud_list)
-        cloud_lbl.setWordWrap(True)
-        cloud_lbl.setStyleSheet(
-            "color: #546e7a; font-size: 8pt; padding-left: 8px; font-style: italic;"
-        )
-        layout.addWidget(cloud_lbl)
+        # --- Troubleshooting ---
+        layout.addWidget(_section("🛠  If you see HTTP 500", "#ffd740"))
+        layout.addWidget(_row("1) Ensure Ollama service is running: ollama serve"))
+        layout.addWidget(_row("2) Verify model exists locally: ollama list"))
+        layout.addWidget(_row("3) Pull missing model: ollama pull <model>"))
+        layout.addWidget(_row("4) Retry with smaller model if VRAM/RAM is exhausted"))
 
         close_btn = QPushButton("Close")
         close_btn.setStyleSheet(
@@ -1208,30 +1370,24 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _populate_model_combos(self) -> None:
-        """Query Ollama AND the VS Code bridge for available models, then populate both dropdowns."""
+        """Query Ollama models and populate dropdowns with clear local/cloud sections."""
         from providers.local_provider import LocalProvider
-        from providers.vscode_provider import VSCodeProvider
         provider = LocalProvider()
-        vsc = VSCodeProvider()
 
-        async def _fetch() -> tuple[list[str], list[str]]:
+        async def _fetch() -> list[str]:
             try:
                 local = await provider.list_models()
             except Exception:
                 local = []
-            try:
-                vscode = await vsc.list_models()
-            except Exception:
-                vscode = []
-            return local, vscode
+            return local
 
         try:
-            local_raw, vscode_raw = asyncio.run(_fetch())
+            local_raw = asyncio.run(_fetch())
         except Exception:
-            local_raw, vscode_raw = [], []
+            local_raw = []
 
-        # Update the VS Code model ID set so bootstrap uses the right provider
-        self._vscode_model_ids = set(vscode_raw)
+        # strict-local: never route through VS Code provider
+        self._vscode_model_ids = set()
 
         saved_left = self._model_prefs.get("left_model", DEFAULT_LEFT_MODEL)
         saved_right = self._model_prefs.get("right_model", DEFAULT_RIGHT_MODEL)
@@ -1246,20 +1402,27 @@ class MainWindow(QMainWindow):
 
             # Build the full model list from Ollama — these are REAL models
             all_ollama = list(local_raw)
+            if self._cloud_models_enabled:
+                for known in _KNOWN_CLOUD_MODELS:
+                    if known not in all_ollama:
+                        all_ollama.append(known)
 
             # Separate cloud-tagged models from true local models
             # Cloud models have ":cloud" or "-cloud" in the Ollama tag
-            cloud_models = sorted([m for m in all_ollama if _is_cloud_model(m)])
             local_models = sorted([m for m in all_ollama if not _is_cloud_model(m)])
+            cloud_models = sorted([m for m in all_ollama if _is_cloud_model(m)])
 
             # Ensure the saved selection and defaults are always selectable
             # (even if Ollama didn't return them — e.g. model was pulled after last run)
             for must_have in (saved, DEFAULT_LEFT_MODEL, DEFAULT_RIGHT_MODEL):
-                if must_have and must_have not in all_ollama and must_have not in self._vscode_model_ids:
-                    if _is_cloud_model(must_have):
+                if not must_have:
+                    continue
+                if _is_cloud_model(must_have):
+                    if self._cloud_models_enabled and must_have not in cloud_models:
                         cloud_models.insert(0, must_have)
-                    else:
-                        local_models.insert(0, must_have)
+                    continue
+                if must_have not in local_models:
+                    local_models.insert(0, must_have)
 
             from PyQt6.QtGui import QFont, QColor, QBrush
 
@@ -1273,30 +1436,20 @@ class MainWindow(QMainWindow):
                 item.setFont(f)
                 item.setForeground(QBrush(QColor("#455a64")))
 
-            # ── Section 1: VS Code bridge models ─────────────────────────
-            if self._vscode_model_ids:
-                _add_header(combo, "  ◈  VS Code Bridge")
-                for m in sorted(self._vscode_model_ids):
-                    combo.addItem(f"  ◈ {m}")
-                combo.insertSeparator(combo.count())
-
-            # ── Section 2: Local Ollama models (always first / primary) ──
+            # ── Local Ollama models (strict local mode) ──
             if local_models:
                 _add_header(combo, "  💻  Local Models")
                 for m in local_models:
                     combo.addItem(f"  💻 {m}")
 
-            # ── Section 3: Cloud-tagged Ollama models ────────────────────
-            if cloud_models:
-                if local_models:
-                    combo.insertSeparator(combo.count())
+            if self._cloud_models_enabled and cloud_models:
                 _add_header(combo, "  ☁  Cloud Models")
                 for m in cloud_models:
                     combo.addItem(f"  ☁ {m}")
 
             # Restore saved selection — try with each prefix
             idx = -1
-            for prefix in ("  💻 ", "  ☁ ", "  ◈ ", ""):
+            for prefix in ("  💻 ", "  ☁ ", ""):
                 idx = combo.findText(f"{prefix}{saved}")
                 if idx >= 0:
                     break
@@ -1336,7 +1489,7 @@ class MainWindow(QMainWindow):
         self._grounding_lbl.setVisible(False)
         self._grounding_bar.setVisible(False)
         # Reset start button label for fresh run
-        self.start_button.setText("\u25b6  Start")
+        self.start_button.setText("\u25b6  Start Debate")
 
         # Reset UI
         self.left_panel.private_view.clear()
@@ -1359,8 +1512,7 @@ class MainWindow(QMainWindow):
         self._pending_left_model = None
         self._pending_right_model = None
         self._cloud_calls = 0
-        self._cloud_calls_lbl.setText("☁ 0 cloud calls")
-        self._cloud_calls_lbl.setStyleSheet("color: #546e7a; font-size: 9pt; font-weight: 600;")
+        self._refresh_cloud_mode_label()
         self._capture_seq = 0
         self._current_tts_msg_idx = -1
         self._current_tts_char_offset = 0
@@ -1370,10 +1522,17 @@ class MainWindow(QMainWindow):
         get_session_manager().pending_tp_key = self._current_tp_key
         # Reset resolution tracking for the new session
         self._last_resolution_payload = {}
+        self._refine_source_session_id = ""
 
         # Rebuild orchestrator to reset memory for fresh start, with chosen models
-        left_model = _clean_model_name(self._astra_model_combo.currentText()) or DEFAULT_LEFT_MODEL
-        right_model = _clean_model_name(self._nova_model_combo.currentText()) or DEFAULT_RIGHT_MODEL
+        left_model = _sanitize_local_model(
+            _clean_model_name(self._astra_model_combo.currentText()),
+            DEFAULT_LEFT_MODEL,
+        )
+        right_model = _sanitize_local_model(
+            _clean_model_name(self._nova_model_combo.currentText()),
+            DEFAULT_RIGHT_MODEL,
+        )
         self.orchestrator, self.debate_config = build_orchestrator(
             self.project_root,
             left_model=left_model,
@@ -1419,16 +1578,19 @@ class MainWindow(QMainWindow):
             self._stop_repo_watchdog()
             return
         repo_path = self._repo_watchdog_meta.get("repo_path", "")
-        if repo_path:
-            try:
-                self._repo_watchdog.check_for_changes(repo_path)
-            except Exception:
-                pass
+        if not repo_path:
+            self._stop_repo_watchdog()
+            return
+        self._repo_watchdog_epoch += 1
+        self._repo_watchdog_last_sig = ""
         self._repo_watchdog_timer.start()
+        QTimer.singleShot(0, self._poll_repo_watchdog)
 
     def _stop_repo_watchdog(self) -> None:
         if self._repo_watchdog_timer.isActive():
             self._repo_watchdog_timer.stop()
+        self._repo_watchdog_epoch += 1
+        self._repo_watchdog_worker = None
 
     def _poll_repo_watchdog(self) -> None:
         if not self._repo_watchdog_meta:
@@ -1440,61 +1602,59 @@ class MainWindow(QMainWindow):
         if not repo_path:
             return
 
-        try:
-            changes = self._repo_watchdog.check_for_changes(repo_path)
-        except Exception:
+        if self._repo_watchdog_worker is not None and self._repo_watchdog_worker.isRunning():
             return
 
-        if not changes.has_changes:
-            return
-
-        signature = json.dumps(
-            {"a": changes.added[:12], "m": changes.modified[:12], "d": changes.deleted[:12]},
-            sort_keys=True,
+        worker = _RepoWatchdogPollWorker(
+            self._repo_watchdog,
+            str(repo_path),
+            self._repo_watchdog_last_sig,
+            self._repo_watchdog_epoch,
+            parent=self,
         )
-        if signature == self._repo_watchdog_last_sig:
+        worker.polled.connect(self._on_repo_watchdog_polled)
+        worker.finished.connect(worker.deleteLater)
+        self._repo_watchdog_worker = worker
+        worker.start()
+
+    def _on_repo_watchdog_polled(self, payload: dict) -> None:
+        self._repo_watchdog_worker = None
+
+        if int(payload.get("epoch", -1)) != self._repo_watchdog_epoch:
+            return
+
+        if payload.get("error"):
+            return
+
+        if not payload.get("has_changes"):
+            return
+
+        signature = str(payload.get("signature", ""))
+        if not signature or signature == self._repo_watchdog_last_sig:
             return
         self._repo_watchdog_last_sig = signature
-
-        try:
-            report = self._repo_watchdog.update_docs_for_changes(repo_path, changes)
-            change_brief = self._repo_watchdog.build_change_brief(changes, report)
-        except Exception:
-            report = None
-            change_brief = "Repository changes detected, but incremental docs refresh failed."
 
         if self.orchestrator is not None:
             self._load_repo_dataset_into_orchestrator()
 
-        added = changes.added[:3]
-        modified = changes.modified[:3]
-        deleted = changes.deleted[:3]
-        lines: list[str] = []
-        if added:
-            lines.append("Added: " + ", ".join(added))
-        if modified:
-            lines.append("Modified: " + ", ".join(modified))
-        if deleted:
-            lines.append("Deleted: " + ", ".join(deleted))
-        short_msg = " | ".join(lines)
+        short_msg = str(payload.get("short_msg", "")).strip()
+        if not short_msg:
+            short_msg = "changes detected"
 
         self._status_bar.showMessage(
             f"Repo Watchdog: detected changes — {short_msg}", 8000
         )
+
         if self.orchestrator is not None:
+            change_brief = str(payload.get("change_brief", "")).strip()
+            if not change_brief:
+                change_brief = "Repository changes detected."
             self.orchestrator.inject_arbiter_message(
                 "[REPO WATCHDOG UPDATE]\n"
                 f"Detected repository changes: {short_msg}\n"
                 f"{change_brief}\n"
                 "Re-check any claims that depend on the changed files."
             )
-        if report is not None:
-            self._status_bar.showMessage(
-                f"Repo Watchdog: {report.updated_files} docs refreshed, {report.deleted_files} removed",
-                5000,
-            )
-        else:
-            self._status_bar.showMessage("Repo Watchdog update injected into debate context", 5000)
 
     def _on_debate_pause_toggled(self, checked: bool) -> None:
         if not hasattr(self, 'orchestrator') or self.orchestrator is None:
@@ -1571,8 +1731,8 @@ class MainWindow(QMainWindow):
         # Reset debate controls
         self._set_debate_transport_state("stopped")
         self.arbiter_panel.set_paused_state(False)
-        # Signal that a session has ended — Start becomes "New Session"
-        self.start_button.setText("\U0001f504  New Session")
+        # Signal that a debate has ended — Start becomes "New Debate"
+        self.start_button.setText("\U0001f504  New Debate")
 
         # Trigger debate summary + verdict worker
         self.scoring_panel.set_summary_generating()
@@ -1595,49 +1755,8 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self._summary_worker.finished.connect(self._on_summary_done)
-        self._summary_worker.failed.connect(
-            lambda e: self._status_bar.showMessage(f"Summary failed: {e[:80]}")
-        )
+        self._summary_worker.failed.connect(self._on_summary_failed)
         self._summary_worker.start()
-
-        # Spawn topic refinement if we have a talking-point key and resolution data
-        if self._current_tp_key and self._last_resolution_payload:
-            try:
-                from config.model_prefs import load_model_prefs
-                prefs = load_model_prefs()
-                refine_model = prefs.get("right_model", "qwen3:30b") or "qwen3:30b"
-            except Exception:
-                refine_model = "qwen3:30b"
-
-            from config.starter_topics import get_topic_by_title
-            st = get_topic_by_title(self._current_topic_title)
-            desc = st.description if st else ""
-            tps = st.talking_points if st else []
-
-            rd = {
-                "truths": self._last_resolution_payload.get("truths_discovered", []),
-                "problems": self._last_resolution_payload.get("problems_found", []),
-                "sub_topics": self._last_resolution_payload.get("sub_topics_explored", []),
-            }
-            self._refine_worker = TopicRefineWorker(
-                title=self._current_topic_title,
-                description=desc,
-                talking_points=tps,
-                resolution_data=rd,
-                model=refine_model,
-                tp_key=self._current_tp_key,
-                session_manager=get_session_manager(),
-                parent=self,
-            )
-            self._refine_worker.finished.connect(
-                lambda _d: self._status_bar.showMessage(
-                    "✨ Topic refined for next session — reopen the topic picker to see it.", 8000
-                )
-            )
-            self._refine_worker.failed.connect(
-                lambda err: self._status_bar.showMessage(f"Topic refinement failed: {err[:80]}")
-            )
-            self._refine_worker.start()
 
     # ------------------------------------------------------------------ scoring
 
@@ -1655,6 +1774,464 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(
             f"🏆 Verdict: {winner} wins — see Scoring & Verdict tab", 8000
         )
+
+        # Refresh session diagnostics now that scoring_report artifacts exist.
+        try:
+            get_session_manager().save_current_session_diagnostics(trigger="summary_done")
+        except Exception:
+            pass
+
+        self._start_topic_refinement(summary_result=result)
+
+    def _on_summary_failed(self, error: str) -> None:
+        self._status_bar.showMessage(f"Summary failed: {error[:80]}")
+        self._start_topic_refinement(summary_result=None)
+
+    def _start_topic_refinement(self, summary_result: dict | None = None) -> None:
+        if not self._current_tp_key or not self._last_resolution_payload:
+            return
+        if self._refine_worker is not None and self._refine_worker.isRunning():
+            return
+
+        sm = get_session_manager()
+        session_id = sm.current_path.name if sm.current_path else ""
+        title, description, talking_points, source_brief = self._build_refinement_source(session_id)
+        if not description and not talking_points:
+            return
+
+        scoring_data: dict = summary_result if isinstance(summary_result, dict) else {}
+        if not scoring_data and session_id:
+            loaded = sm.load_scoring_report(session_id)
+            if isinstance(loaded, dict):
+                scoring_data = loaded
+
+        diagnostics_data: dict = {}
+        graph_rows: list = []
+        if session_id:
+            diag = sm.load_session_diagnostics(session_id)
+            if isinstance(diag, dict):
+                diagnostics_data = diag
+            rows = sm.load_session_graph(session_id)
+            if isinstance(rows, list):
+                graph_rows = rows
+
+        resolution_data = {
+            "truths": self._last_resolution_payload.get("truths_discovered", []),
+            "problems": self._last_resolution_payload.get("problems_found", []),
+            "sub_topics": self._last_resolution_payload.get("sub_topics_explored", []),
+            "total_memory_facts": self._last_resolution_payload.get("total_memory_facts", 0),
+        }
+        continuation_context = self._build_continuation_intelligence(
+            tp_key=self._current_tp_key,
+            current_session_id=session_id,
+            current_title=title,
+            current_description=description,
+            current_talking_points=talking_points,
+        )
+
+        try:
+            prefs = load_model_prefs()
+            refine_model = prefs.get("right_model", "qwen3:30b") or "qwen3:30b"
+        except Exception:
+            refine_model = "qwen3:30b"
+
+        self._refine_source_session_id = session_id
+        self._refine_worker = TopicRefineWorker(
+            title=title,
+            description=description,
+            talking_points=talking_points,
+            resolution_data=resolution_data,
+            scoring_data=scoring_data,
+            diagnostics_data=diagnostics_data,
+            graph_rows=graph_rows,
+            session_brief_data=source_brief,
+            continuation_context=continuation_context,
+            model=refine_model,
+            tp_key=self._current_tp_key,
+            session_manager=sm,
+            parent=self,
+        )
+        self._refine_worker.finished.connect(self._on_topic_refined)
+        self._refine_worker.failed.connect(self._on_topic_refine_failed)
+        self._refine_worker.start()
+
+    def _build_refinement_source(self, session_id: str) -> tuple[str, str, list[str], dict]:
+        sm = get_session_manager()
+        brief_data = sm.load_session_brief(session_id) if session_id else None
+        source_brief = brief_data if isinstance(brief_data, dict) else {}
+
+        title = str(source_brief.get("title", "") or self._current_topic_title).strip()
+        description = str(source_brief.get("description", "") or "").strip()
+
+        raw_tps = source_brief.get("talking_points", [])
+        talking_points = [
+            str(tp).strip()
+            for tp in raw_tps
+            if str(tp).strip()
+        ] if isinstance(raw_tps, list) else []
+
+        if not description or not talking_points:
+            parsed = self._parse_topic_context_brief(self._current_topic_context)
+            if not description:
+                description = parsed.get("description", "")
+            if not talking_points:
+                talking_points = parsed.get("talking_points", [])
+            if not title:
+                title = parsed.get("title", "")
+
+        if not (description and talking_points):
+            from config.starter_topics import get_topic_by_title
+            starter = get_topic_by_title(title or self._current_topic_title)
+            if starter is not None:
+                if not description:
+                    description = starter.description
+                if not talking_points:
+                    talking_points = list(starter.talking_points)
+                if not title:
+                    title = starter.title
+
+        if not title:
+            title = self._current_topic_title
+
+        return title, description.strip(), talking_points, source_brief
+
+    @staticmethod
+    def _parse_topic_context_brief(context: str) -> dict:
+        text = (context or "").strip()
+        if not text:
+            return {"title": "", "description": "", "talking_points": []}
+
+        key_marker = "KEY TALKING POINTS"
+        idx = text.find(key_marker)
+        if idx >= 0:
+            head = text[:idx].strip()
+            tail = text[idx + len(key_marker):]
+        else:
+            head = text
+            tail = ""
+
+        head_lines = [ln.strip() for ln in head.splitlines() if ln.strip()]
+        title = head_lines[0] if head_lines else ""
+        description = "\n".join(head_lines[1:]).strip() if len(head_lines) > 1 else ""
+
+        talking_points: list[str] = []
+        for raw in tail.splitlines():
+            s = raw.strip()
+            if not s:
+                continue
+            up = s.upper()
+            if up.startswith("REPO MODE:") or up.startswith("REPO WATCHDOG SNAPSHOT"):
+                break
+            s = re.sub(r"^[•\-*\d\.\)\s]+", "", s).strip()
+            if not s:
+                continue
+            talking_points.append(s)
+
+        return {
+            "title": title,
+            "description": description,
+            "talking_points": talking_points,
+        }
+
+    def _build_continuation_intelligence(
+        self,
+        *,
+        tp_key: str,
+        current_session_id: str,
+        current_title: str,
+        current_description: str,
+        current_talking_points: list[str],
+    ) -> dict:
+        sm = get_session_manager()
+        sessions = sm.list_sessions_for_tp(tp_key) if tp_key else []
+        ordered = sorted(sessions, key=lambda m: m.start_ts) if sessions else []
+
+        original_payload = {
+            "title": current_title,
+            "description": current_description,
+            "talking_points": list(current_talking_points),
+            "session_id": current_session_id,
+        }
+
+        if ordered:
+            first_meta = ordered[0]
+            first_brief = sm.load_session_brief(first_meta.session_id)
+            if isinstance(first_brief, dict):
+                original_payload["title"] = str(first_brief.get("title", "") or original_payload["title"]).strip()
+                original_payload["description"] = str(first_brief.get("description", "") or original_payload["description"]).strip()
+                raw = first_brief.get("talking_points", [])
+                if isinstance(raw, list):
+                    tps = [str(tp).strip() for tp in raw if str(tp).strip()]
+                    if tps:
+                        original_payload["talking_points"] = tps
+            if not original_payload["description"] or not original_payload["talking_points"]:
+                parsed = self._parse_topic_context_brief(first_meta.topic)
+                if not original_payload["description"]:
+                    original_payload["description"] = parsed.get("description", "")
+                if not original_payload["talking_points"]:
+                    original_payload["talking_points"] = parsed.get("talking_points", [])
+            original_payload["session_id"] = first_meta.session_id
+
+        agreements: list[str] = []
+        disagreements: list[str] = []
+        open_problems: list[str] = []
+        unresolved: list[str] = []
+        covered_ground: list[str] = []
+        transcript_signals: list[str] = []
+        scoring_trend: list[str] = []
+
+        seen_agree: set[str] = set()
+        seen_disagree: set[str] = set()
+        seen_problem: set[str] = set()
+        seen_unresolved: set[str] = set()
+        seen_covered: set[str] = set()
+        seen_signal: set[str] = set()
+
+        for meta in ordered:
+            sid = meta.session_id
+            brief = sm.load_session_brief(sid)
+            if isinstance(brief, dict):
+                raw_tps = brief.get("talking_points", [])
+                if isinstance(raw_tps, list):
+                    self._append_unique(
+                        covered_ground,
+                        [str(tp).strip() for tp in raw_tps if str(tp).strip()],
+                        seen_covered,
+                        max_items=80,
+                    )
+
+            sig = self._collect_session_signals(sid)
+            self._append_unique(agreements, sig.get("agreements", []), seen_agree, max_items=60)
+            self._append_unique(disagreements, sig.get("disagreements", []), seen_disagree, max_items=60)
+            self._append_unique(open_problems, sig.get("problems", []), seen_problem, max_items=80)
+            self._append_unique(unresolved, sig.get("unresolved", []), seen_unresolved, max_items=80)
+            self._append_unique(transcript_signals, sig.get("signals", []), seen_signal, max_items=80)
+
+            score = sm.load_scoring_report(sid)
+            if isinstance(score, dict):
+                winner = str(score.get("winner", "Draw") or "Draw").strip()
+                margin = str(score.get("margin", "") or "").strip()
+                turns = int(score.get("turns", 0) or 0)
+                summary = str(score.get("summary", "") or "").strip()
+                scoring_trend.append(
+                    f"{sid}: winner={winner} margin={margin or 'n/a'} turns={turns} summary={summary[:140]}"
+                )
+
+        return {
+            "thread_session_count": len(ordered),
+            "thread_session_ids": [m.session_id for m in ordered],
+            "original": original_payload,
+            "current": {
+                "title": current_title,
+                "description": current_description,
+                "talking_points": list(current_talking_points),
+                "session_id": current_session_id,
+            },
+            "agreements": agreements,
+            "disagreements": disagreements,
+            "open_problems": open_problems,
+            "unresolved": unresolved,
+            "covered_ground": covered_ground,
+            "transcript_signals": transcript_signals,
+            "scoring_trend": scoring_trend[:20],
+        }
+
+    def _collect_session_signals(self, session_id: str) -> dict:
+        sm = get_session_manager()
+        events = sm.load_session_transcript(session_id)
+
+        agreements: list[str] = []
+        disagreements: list[str] = []
+        problems: list[str] = []
+        unresolved: list[str] = []
+        signals: list[str] = []
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            etype = str(ev.get("event_type", "") or "").strip()
+            payload = ev.get("payload", {}) if isinstance(ev.get("payload", {}), dict) else {}
+
+            if etype == "resolution":
+                agreements.extend(str(x).strip() for x in payload.get("truths_discovered", []) if str(x).strip())
+                problems.extend(str(x).strip() for x in payload.get("problems_found", []) if str(x).strip())
+                continue
+
+            if etype not in {"public_message", "turn"}:
+                continue
+
+            text = str(payload.get("message", "") or payload.get("text", "") or "")
+            if not text:
+                continue
+
+            agreements.extend(self._extract_prefixed_lines(text, ("TRUTH:", "VERIFIED:", "CONCLUDE:"), max_items=8))
+            disagreements.extend(self._extract_prefixed_lines(text, ("CONTRADICT:", "FALSE:"), max_items=8))
+            problems.extend(self._extract_prefixed_lines(text, ("PROBLEM:",), max_items=8))
+            unresolved.extend(self._extract_prefixed_lines(text, ("QUESTION:", "HYPOTHETICAL:", "UNRESOLVED:"), max_items=8))
+
+            for line in text.splitlines():
+                s = " ".join(line.split()).strip()
+                if not s:
+                    continue
+                if s.endswith("?") and len(s) > 30:
+                    unresolved.append(s)
+                if any(tok in s.upper() for tok in ("PROBLEM:", "QUESTION:", "UNRESOLVED:", "HYPOTHETICAL:")):
+                    signals.append(s[:260])
+
+        return {
+            "agreements": self._dedupe_trim(agreements, max_items=50),
+            "disagreements": self._dedupe_trim(disagreements, max_items=50),
+            "problems": self._dedupe_trim(problems, max_items=70),
+            "unresolved": self._dedupe_trim(unresolved, max_items=70),
+            "signals": self._dedupe_trim(signals, max_items=70),
+        }
+
+    @staticmethod
+    def _extract_prefixed_lines(text: str, prefixes: tuple[str, ...], max_items: int = 8) -> list[str]:
+        out: list[str] = []
+        upper_prefixes = tuple(p.upper() for p in prefixes)
+        for line in text.splitlines():
+            s = " ".join(line.split()).strip()
+            if not s:
+                continue
+            us = s.upper()
+            for pref in upper_prefixes:
+                if us.startswith(pref):
+                    item = s[len(pref):].strip(" -:\t")
+                    if item:
+                        out.append(item[:260])
+                    break
+            if len(out) >= max_items:
+                break
+        return out
+
+    @staticmethod
+    def _dedupe_trim(items: list[str], max_items: int = 40) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in items:
+            s = " ".join(str(raw).split()).strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+            if len(out) >= max_items:
+                break
+        return out
+
+    @staticmethod
+    def _append_unique(target: list[str], additions: list[str], seen: set[str], *, max_items: int) -> None:
+        for raw in additions:
+            s = " ".join(str(raw).split()).strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            target.append(s)
+            if len(target) >= max_items:
+                break
+
+    def _build_refined_topic_context(self, title: str, description: str, talking_points: list[str], session_brief: str) -> str:
+        clean_tps = [str(tp).strip() for tp in talking_points if str(tp).strip()]
+        if clean_tps and "anchor every argument" not in clean_tps[0].lower():
+            clean_tps = ["— anchor every argument to these:", *clean_tps]
+        if not clean_tps:
+            clean_tps = ["— anchor every argument to these:"]
+
+        tp_block = "\n".join(f"  • {tp}" for tp in clean_tps[:12])
+        context = (
+            f"{title}\n\n"
+            f"{description.strip()}\n\n"
+            "KEY TALKING POINTS — anchor every argument to these:\n"
+            f"{tp_block}"
+        )
+
+        brief = (session_brief or "").strip()
+        if brief:
+            context += f"\n\nLAST SESSION EVOLUTION NOTE:\n{brief[:220]}"
+
+        existing = self._current_topic_context or ""
+        marker = "REPO MODE:"
+        marker_idx = existing.find(marker)
+        if marker_idx >= 0:
+            repo_suffix = existing[marker_idx:].strip()
+            if repo_suffix and "REPO MODE:" not in context:
+                context += f"\n\n{repo_suffix}"
+
+        return context.strip()
+
+    def _on_topic_refined(self, result: dict) -> None:
+        description = str(result.get("description", "") or "").strip()
+        talking_points_raw = result.get("talking_points", [])
+        talking_points = [
+            str(tp).strip()
+            for tp in talking_points_raw
+            if str(tp).strip()
+        ] if isinstance(talking_points_raw, list) else []
+        session_brief = str(result.get("session_brief", "") or "").strip()
+
+        if not description and not talking_points:
+            self._status_bar.showMessage("Topic refinement returned no usable updates", 6000)
+            return
+
+        if not description or not talking_points:
+            _, base_desc, base_tps, _ = self._build_refinement_source(self._refine_source_session_id)
+            if not description:
+                description = base_desc
+            if not talking_points:
+                talking_points = base_tps
+
+        self._current_topic_context = self._build_refined_topic_context(
+            self._current_topic_title,
+            description,
+            talking_points,
+            session_brief,
+        )
+        self._save_topic_selection()
+        self._refresh_topic_button()
+        self._persist_refined_custom_debate(description, talking_points)
+        self._status_bar.showMessage(
+            "✨ Topic evolved from this session — New Debate now uses the refined brief.",
+            9000,
+        )
+
+    def _persist_refined_custom_debate(self, description: str, talking_points: list[str]) -> None:
+        session_id = self._refine_source_session_id
+        if not session_id:
+            return
+        sm = get_session_manager()
+        brief = sm.load_session_brief(session_id)
+        if not isinstance(brief, dict):
+            return
+
+        debate_id = str(brief.get("debate_id", "") or "").strip()
+        if not debate_id:
+            return
+
+        mode = str(brief.get("mode", "static_ingestion") or "static_ingestion").strip() or "static_ingestion"
+        repo_path = str(brief.get("repo_path", "") or "").strip()
+
+        try:
+            from core.custom_debates import get_custom_debate_store
+            store = get_custom_debate_store(sm.root)
+            store.upsert(
+                debate_id=debate_id,
+                title=self._current_topic_title,
+                description=description,
+                talking_points=talking_points,
+                mode=mode,
+                repo_path=repo_path,
+            )
+        except Exception:
+            return
+
+    def _on_topic_refine_failed(self, error: str) -> None:
+        self._status_bar.showMessage(f"Topic refinement failed: {error[:120]}", 7000)
 
     # ------------------------------------------------------------------ analytics
 
@@ -1964,6 +2541,12 @@ class MainWindow(QMainWindow):
                     model_name = getattr(self.orchestrator.left_agent.provider, "model", "")
                 else:
                     model_name = getattr(self.orchestrator.right_agent.provider, "model", "")
+                if not self._pending_left_model and not self._pending_right_model:
+                    live_left = getattr(self.orchestrator.left_agent.provider, "model", "?")
+                    live_right = getattr(self.orchestrator.right_agent.provider, "model", "?")
+                    self._runtime_badge.setText(
+                        f"✓ Ollama  |  Astra: {live_left}  ·  Nova: {live_right}"
+                    )
             self.center_panel.append_message(
                 agent,
                 message,
@@ -1974,11 +2557,6 @@ class MainWindow(QMainWindow):
                 model_name=model_name,
                 reframe=event.payload.get("reframe"),
             )
-            # Track cloud model usage
-            if _is_cloud_model(model_name):
-                self._cloud_calls += 1
-                self._cloud_calls_lbl.setText(f"☁ {self._cloud_calls} cloud call{'s' if self._cloud_calls != 1 else ''}")
-                self._cloud_calls_lbl.setStyleSheet("color: #4dd0e1; font-size: 9pt; font-weight: 700;")
             # After Nova's turn (end of a full pair), apply any pending model swaps
             if agent.lower() == "nova" and self.orchestrator is not None:
                 swapped = False
@@ -2091,7 +2669,7 @@ class MainWindow(QMainWindow):
         elif event.event_type == "graph":
             tree = event.payload.get("tree")
             if tree:
-                self.graph_panel.set_rows_rich(tree)
+                self.graph_panel.set_rows_rich(tree, edges=event.payload.get("edges"))
             else:
                 self.graph_panel.set_rows(event.payload["rows"])
 

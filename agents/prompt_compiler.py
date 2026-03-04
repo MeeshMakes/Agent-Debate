@@ -82,6 +82,132 @@ _SOULS: dict[str, str] = {
 }
 
 
+_STRUCTURE_CUES = (
+    "architecture", "architectural", "system design", "data flow", "workflow",
+    "pipeline", "graph", "dependency", "module", "orchestrator", "integration",
+    "component", "state machine", "repo", "codebase", "topology",
+)
+
+_UIUX_CUES = (
+    "ui", "ux", "user experience", "user interface", "navigation",
+    "dialog", "toolbar", "button", "accessibility", "usability", "interaction",
+)
+
+_GRAPH_CUES = (
+    "graph", "node", "edge", "semantic distance", "knowledge graph",
+    "supports", "refutes", "contradicts", "adjacency", "topology",
+)
+
+
+def _topic_blob(topic: str, talking_point: str, dataset_context: str) -> str:
+    base = f"{topic} {talking_point}"
+    if dataset_context:
+        base += " " + dataset_context[:1500]
+    return base.lower()
+
+
+def _needs_plaintext_diagram(topic: str, talking_point: str, dataset_context: str) -> bool:
+    blob = _topic_blob(topic, talking_point, dataset_context)
+    return any(cue in blob for cue in _STRUCTURE_CUES)
+
+
+def _needs_uiux_blueprint(topic: str, talking_point: str, dataset_context: str) -> bool:
+    blob = _topic_blob(topic, talking_point, dataset_context)
+    return any(cue in blob for cue in _UIUX_CUES)
+
+
+def _needs_graph_schema(topic: str, talking_point: str, dataset_context: str) -> bool:
+    blob = _topic_blob(topic, talking_point, dataset_context)
+    return any(cue in blob for cue in _GRAPH_CUES)
+
+
+def _needs_creative_proposals(topic: str, talking_point: str, dataset_context: str) -> bool:
+    return (
+        _needs_plaintext_diagram(topic, talking_point, dataset_context)
+        or _needs_uiux_blueprint(topic, talking_point, dataset_context)
+        or _needs_graph_schema(topic, talking_point, dataset_context)
+    )
+
+
+def _recent_has_header(conversation_history: list[str] | None, header: str) -> bool:
+    if not conversation_history:
+        return False
+    scan = "\n".join(conversation_history[-6:]).upper()
+    return f"{header.upper()}:" in scan
+
+
+def _build_artifact_contract(
+    topic: str,
+    talking_point: str,
+    dataset_context: str,
+    conversation_history: list[str] | None = None,
+) -> str:
+    need_diagram = _needs_plaintext_diagram(topic, talking_point, dataset_context)
+    need_uiux = _needs_uiux_blueprint(topic, talking_point, dataset_context)
+    need_graph = _needs_graph_schema(topic, talking_point, dataset_context)
+    need_proposals = _needs_creative_proposals(topic, talking_point, dataset_context)
+    if not need_diagram and not need_uiux and not need_graph and not need_proposals:
+        return ""
+
+    recent_diagram = _recent_has_header(conversation_history, "DIAGRAM")
+    recent_ui_plan = _recent_has_header(conversation_history, "UI-PLAN")
+    recent_graph_schema = _recent_has_header(conversation_history, "GRAPH-SCHEMA")
+
+    lines = [
+        "\nARTIFACT REQUIREMENTS FOR THIS TURN (high priority):",
+        "- Go beyond fundamentals: include implementation-grade detail, not only abstract principles.",
+        "- Avoid copy-paste repetition: if an artifact already appeared recently, provide concise DELTA updates.",
+    ]
+
+    if need_diagram:
+        if recent_diagram:
+            lines.append(
+                "- DIAGRAM already present in recent turns: add only a DIAGRAM-DELTA line unless architecture changed materially."
+            )
+        else:
+            lines.extend([
+                "- Include one plain-text architecture diagram block prefixed with DIAGRAM:.",
+                "- Use ASCII only (no Mermaid/Markdown image). Include at least 4 nodes and directional edges.",
+                "- Example shape: [UI] -> [Orchestrator] -> [Memory] -> [Scoring]",
+            ])
+
+    if need_uiux:
+        if recent_ui_plan:
+            lines.append(
+                "- UI-PLAN already present recently: add only changed items (or skip if no UX delta this turn)."
+            )
+        else:
+            lines.extend([
+                "- Include one implementation block prefixed with UI-PLAN:.",
+                "- Provide 3 concrete UI/UX changes. For each change include:",
+                "  target surface, user pain, exact interaction change, implementation hook (file/class/function if known), acceptance check.",
+                "- If a file/function hook is not visible in dataset context, mark that line as HYPOTHETICAL.",
+            ])
+
+    if need_graph:
+        if recent_graph_schema:
+            lines.append(
+                "- GRAPH-SCHEMA already present recently: provide incremental edges only (new or changed relations), not full reprint."
+            )
+        else:
+            lines.extend([
+                "- Include one graph schema block prefixed with GRAPH-SCHEMA:.",
+                "- Define at least 3 directed edges using this shape:",
+                "  source_node -> target_node | relation=<supports/refutes/contradicts/elaborates/synthesizes> | weight=<0.0-1.0>",
+                "- Tie each edge to one concrete claim in this turn.",
+            ])
+
+    if need_proposals:
+        lines.extend([
+            "- Add a PROPOSALS: block with at least 2 concrete design proposals.",
+            "- Label each as PROPOSAL-1 / PROPOSAL-2 and include:",
+            "  what to add/change, why it solves a real failure mode, implementation hook, and expected UX/system impact.",
+            "- At least one proposal must introduce a NEW workflow/module/logic extension (not just tweak wording).",
+        ])
+
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Main compiler
 # ---------------------------------------------------------------------------
@@ -214,6 +340,13 @@ def compile_persona_prompt(
             "————————————————————————————————————————————————————————————\n"
         )
 
+    artifact_block = _build_artifact_contract(
+        topic=topic,
+        talking_point=talking_point,
+        dataset_context=dataset_context,
+        conversation_history=conversation_history,
+    )
+
     # Stats-driven urgency line
     stats = adaptive_store.get_stats(topic)
     urgency_line = _build_urgency_line(stats)
@@ -222,6 +355,7 @@ def compile_persona_prompt(
 DEBATE TOPIC: {topic}
 YOUR CURRENT FOCAL POINT: {talking_point}
 {urgency_line}{mem_block}{adaptive_section}{sub_block}{anchor_block}{bias_block}{conv_block}{living_block}{res_block}{ds_block}{focus_block}
+{artifact_block}
 
 ———— THINK-TANK ETHOS — read before writing a single word ————
 
@@ -274,6 +408,12 @@ did we leave this exchange closer to truth than we entered it?
    Never open with a compliment or acknowledgment of the other agent.
    Start with your idea. Get straight into the substance.
 
+6b. BE CREATIVE AND PROPOSAL-DRIVEN in code/system debates.
+    Do not only critique the existing design.
+    Introduce at least two concrete possible improvements as PROPOSAL-1 and PROPOSAL-2:
+    one can be low-risk (incremental), one should be high-leverage (new workflow/module/logic extension).
+    Frame each as implementable change with explicit tradeoffs and success criteria.
+
 7. USE THESE SIGNAL PREFIXES — weave them naturally into your prose, not
    as cold bullet points.  Each one updates the shared living record:
    — TRUTH: <statement>        when evidence and logic together confirm something
@@ -302,8 +442,10 @@ did we leave this exchange closer to truth than we entered it?
    to go deeper.  Not a rhetorical flourish — a genuine intellectual gap
    that neither of you has answered yet.
 
-LENGTH: 5–8 rich paragraphs.  Dense but readable.  No bullet lists in
-your main prose.  Think in full connected ideas.  Depth over breadth.
+LENGTH: 5–8 rich paragraphs by default. Dense but readable. Think in full
+connected ideas. If ARTIFACT REQUIREMENTS are present, you may include one
+compact structured block for DIAGRAM/UI-PLAN in addition to prose.
+Depth over breadth.
 """
     return prompt.strip()
 

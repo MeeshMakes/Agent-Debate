@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from agents.persona_agent import PersonaAgent, PersonaConfig
@@ -16,9 +17,12 @@ from providers.vscode_provider import VSCodeProvider
 from runtime_logging.event_logger import EventLogger
 
 
+_ALLOW_VSCODE_PROVIDER = os.getenv("AGENT_DEBATE_ALLOW_VSCODE_PROVIDER", "0").strip() in {"1", "true", "yes"}
+
+
 def _make_provider(model: str, vscode_model_ids: set[str]) -> LocalProvider | VSCodeProvider:
     """Return the correct provider for the given model name."""
-    if model in vscode_model_ids:
+    if _ALLOW_VSCODE_PROVIDER and model in vscode_model_ids:
         return VSCodeProvider(model=model)
     return LocalProvider(model=model)
 

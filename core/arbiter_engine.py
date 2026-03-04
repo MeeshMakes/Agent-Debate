@@ -44,6 +44,39 @@ _CODE_ANCHOR_RE = re.compile(
 )
 _HYPOTHETICAL_RE = re.compile(r"\bHYPOTHETICAL\s*:", re.IGNORECASE)
 _PY_FILE_RE = re.compile(r"\b([\w/\\]+\.py)\b", re.IGNORECASE)
+_STRUCTURE_TOPIC_RE = re.compile(
+    r"\b(architecture|architectural|system design|data flow|workflow|pipeline|graph|"
+    r"module|integration|orchestrator|component|state machine|topology)\b",
+    re.IGNORECASE,
+)
+_UIUX_TOPIC_RE = re.compile(
+    r"\b(ui|ux|user interface|user experience|navigation|dialog|toolbar|button|"
+    r"interaction|usability|accessibility)\b",
+    re.IGNORECASE,
+)
+_DIAGRAM_HEADER_RE = re.compile(r"(^|\n)\s*(?:DIAGRAM|ARCH-DIAGRAM|ASCII-DIAGRAM)\s*:", re.IGNORECASE)
+_ASCII_EDGE_RE = re.compile(r"->|=>|-->|──>|\bflows?\s+to\b", re.IGNORECASE)
+_NODE_RE = re.compile(r"\[[^\]]+\]|\([^\)]+\)|\b[A-Z][A-Za-z0-9_]{2,}\b")
+_UI_PLAN_HEADER_RE = re.compile(r"(^|\n)\s*UI-PLAN\s*:", re.IGNORECASE)
+_CHANGE_ITEM_RE = re.compile(r"\bCHANGE\s*[-_ ]?\d+\b|(^|\n)\s*(?:\d+\.|-)\s+", re.IGNORECASE)
+_HOOK_HINT_RE = re.compile(r"\.py\b|\bclass\b|\bdef\b|\bfunction\b|\bmethod\b|\bwidget\b|\bdialog\b|\bpanel\b", re.IGNORECASE)
+_ACCEPT_HINT_RE = re.compile(r"\bacceptance\b|\bverify\b|\bcheck\b|\bexpected\b|\bpass(es)?\b", re.IGNORECASE)
+_GRAPH_TOPIC_RE = re.compile(r"\b(graph|node|edge|semantic distance|knowledge graph|adjacency|topology)\b", re.IGNORECASE)
+_GRAPH_SCHEMA_HEADER_RE = re.compile(r"(^|\n)\s*(?:GRAPH-SCHEMA|GRAPH SCHEMA|EDGE-SCHEMA)\s*:", re.IGNORECASE)
+_GRAPH_EDGE_LINE_RE = re.compile(
+    r"^\s*[^\n|]{2,}->[^\n|]{2,}\s*\|\s*relation\s*=\s*[a-z_]{3,}(?:\s*\|\s*(?:weight|confidence)\s*=\s*(?:1(?:\.0+)?|0(?:\.\d+)?))?",
+    re.IGNORECASE | re.MULTILINE,
+)
+_GRAPH_WEIGHT_RE = re.compile(
+    r"\|\s*(?:weight|confidence)\s*=\s*(?:1(?:\.0+)?|0(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+_SECTION_HEADER_RE = re.compile(r"(^|\n)\s*[A-Z][A-Z\- ]{2,}\s*:")
+_PROPOSAL_MARKER_RE = re.compile(
+    r"\b(?:PROPOSAL\s*[-_ ]?\d+|PROPOSE\s*[-_ ]?\d+|NEW\s+WORKFLOW|NEW\s+MODULE|"
+    r"EXTEND\s+LOGIC|ADD\s+(?:A|AN|THE)\s+(?:STAGE|PANEL|PIPELINE|CHECKPOINT|GUARD))\b",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +117,11 @@ class ArbiterEngine:
         self._all_mentioned_files: set[str] = set()
         self._findings: list[StructuredFinding] = []
         self._session_label: str = "v?"
+        self._artifact_last_warn_turn: dict[str, int] = {}
+        self._artifact_last_ok_turn: dict[str, int] = {}
+        self._artifact_last_missing_sig: dict[str, str] = {}
+        self._artifact_warn_cooldown: int = 8
+        self._artifact_ok_grace_turns: int = 2
 
     def set_session(self, label: str) -> None:
         self._session_label = label
@@ -127,6 +165,14 @@ class ArbiterEngine:
         # 3. Fabrication detection
         fabrication_warning, fab_msg = self._check_fabrications(current_message)
 
+        # 3b. Structured artifact quality checks (diagram + UI/UX implementation detail)
+        artifact_msg = self._check_artifact_quality(
+            topic=topic,
+            message=current_message,
+            turn_index=turn_index,
+            agent_name=agent_name,
+        )
+
         # 4. Exploration directive (every 4 turns to avoid spam)
         directive = self._build_exploration_directive(agent_name) if turn_index % 4 == 0 else ""
 
@@ -151,6 +197,15 @@ class ArbiterEngine:
                 fabrication_warning=True,
                 exploration_directive=directive,
                 message=fab_msg,
+            )
+
+        if artifact_msg:
+            return ArbiterDecision(
+                intervention=True,
+                force_synthesis=False,
+                fabrication_warning=False,
+                exploration_directive=directive,
+                message=artifact_msg,
             )
 
         if force_synthesis:
@@ -234,6 +289,63 @@ class ArbiterEngine:
             "If no dataset evidence exists, prefix the claim with HYPOTHETICAL: instead."
         )
 
+    def _check_artifact_quality(self, topic: str, message: str, turn_index: int, agent_name: str) -> str:
+        """Require concrete artifacts on architecture/UI-heavy debates."""
+        combined = f"{topic}\n{message[:1200]}"
+        needs_diagram = bool(_STRUCTURE_TOPIC_RE.search(combined))
+        needs_uiux = bool(_UIUX_TOPIC_RE.search(combined))
+        needs_graph = bool(_GRAPH_TOPIC_RE.search(combined))
+        needs_proposals = needs_diagram or needs_uiux or needs_graph
+        has_diagram = _has_plaintext_diagram(message)
+        has_uiux = _has_uiux_plan(message)
+        has_graph = _has_graph_schema(message)
+        has_proposals = bool(_PROPOSAL_MARKER_RE.search(message))
+
+        missing: list[str] = []
+        if needs_graph and not has_graph and turn_index % 3 == 1:
+            missing.append(
+                "a GRAPH-SCHEMA: block with at least 3 typed directed edges and weights"
+            )
+        if needs_diagram and not has_diagram and (not needs_graph or turn_index % 4 == 0):
+            missing.append(
+                "a plain-text DIAGRAM: block (ASCII nodes + directional edges)"
+            )
+        if needs_uiux and not has_uiux and not needs_graph:
+            missing.append(
+                "a UI-PLAN: block with 3 concrete changes including implementation hook + acceptance check"
+            )
+        if needs_proposals and not has_proposals:
+            missing.append(
+                "at least 2 concrete PROPOSAL-* lines introducing new workflow/module/logic improvements"
+            )
+
+        if not missing:
+            if agent_name:
+                self._artifact_last_ok_turn[agent_name] = turn_index
+                self._artifact_last_missing_sig.pop(agent_name, None)
+            return ""
+
+        if agent_name:
+            last_warn = self._artifact_last_warn_turn.get(agent_name, -10_000)
+            last_ok = self._artifact_last_ok_turn.get(agent_name, -10_000)
+            missing_sig = " | ".join(missing)
+            last_sig = self._artifact_last_missing_sig.get(agent_name, "")
+            if (turn_index - last_warn) < self._artifact_warn_cooldown:
+                return ""
+            if (turn_index - last_ok) <= self._artifact_ok_grace_turns:
+                return ""
+            if last_sig == missing_sig and (turn_index - last_warn) < (self._artifact_warn_cooldown * 2):
+                return ""
+            self._artifact_last_warn_turn[agent_name] = turn_index
+            self._artifact_last_missing_sig[agent_name] = missing_sig
+
+        return (
+            "ARTIFACT QUALITY DIRECTIVE: Your last turn stayed too abstract. "
+            "Next turn must include " + " and ".join(missing) + ". "
+            "Focus on executable design changes, not only high-level critique. "
+            "If a file/function hook is uncertain, mark it HYPOTHETICAL."
+        )
+
     def _build_exploration_directive(self, agent_name: str) -> str:
         speculated = self._speculated_files.get(agent_name, set())
         cited = self._cited_files.get(agent_name, set())
@@ -270,3 +382,46 @@ def _basename(path: str) -> str:
 
 def _extract_mentioned_files(text: str) -> list[str]:
     return [_basename(m) for m in _PY_FILE_RE.findall(text) if m]
+
+
+def _has_plaintext_diagram(text: str) -> bool:
+    body = _extract_named_block(text, _DIAGRAM_HEADER_RE, limit=900)
+    if not body:
+        edge_lines = [ln for ln in text.splitlines() if _ASCII_EDGE_RE.search(ln)]
+        if len(edge_lines) < 2:
+            return False
+        node_count = sum(len(_NODE_RE.findall(ln)) for ln in edge_lines)
+        return node_count >= 4
+    has_edges = bool(_ASCII_EDGE_RE.search(body))
+    nodes = _NODE_RE.findall(body)
+    return has_edges and len(nodes) >= 4
+
+
+def _has_uiux_plan(text: str) -> bool:
+    body = _extract_named_block(text, _UI_PLAN_HEADER_RE, limit=1400)
+    if not body:
+        return False
+    change_items = _CHANGE_ITEM_RE.findall(body)
+    has_hook = bool(_HOOK_HINT_RE.search(body))
+    has_accept = bool(_ACCEPT_HINT_RE.search(body))
+    return len(change_items) >= 3 and has_hook and has_accept
+
+
+def _has_graph_schema(text: str) -> bool:
+    body = _extract_named_block(text, _GRAPH_SCHEMA_HEADER_RE, limit=1200)
+    if not body:
+        return False
+    typed_edges = _GRAPH_EDGE_LINE_RE.findall(body)
+    weighted_edges = _GRAPH_WEIGHT_RE.findall(body)
+    return len(typed_edges) >= 3 and len(weighted_edges) >= 2
+
+
+def _extract_named_block(text: str, header_re: re.Pattern[str], limit: int) -> str:
+    match = header_re.search(text)
+    if not match:
+        return ""
+    tail = text[match.end(): match.end() + limit]
+    next_header = _SECTION_HEADER_RE.search(tail)
+    if next_header:
+        return tail[:next_header.start()]
+    return tail

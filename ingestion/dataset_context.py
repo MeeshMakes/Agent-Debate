@@ -83,7 +83,8 @@ class DatasetContextProvider:
             return ""
 
         query_keywords = _extract_query_keywords(query)
-        if not query_keywords:
+        explicit_targets = _extract_query_file_targets(query)
+        if not query_keywords and not explicit_targets:
             # Fallback: return highest-weighted chunks
             scored = [(i, f.get("tfidf_weight", 0.5)) for i, f in enumerate(self._facts)]
         else:
@@ -92,7 +93,10 @@ class DatasetContextProvider:
                 fact_keywords = set(fact.get("keywords", []))
                 overlap = len(query_keywords & fact_keywords)
                 weight = fact.get("tfidf_weight", 0.5)
+                source_path = str(fact.get("source_path", "")).strip()
+                source_file = str(fact.get("source_file", "")).strip()
                 score = (overlap + 0.1) * weight
+                score += _explicit_target_score(explicit_targets, source_path, source_file)
 
                 # Bonus for unseen chunks
                 if prefer_unseen and agent_name:
@@ -105,14 +109,39 @@ class DatasetContextProvider:
         # Sort by score descending, then select with per-file diversity limits
         scored.sort(key=lambda x: x[1], reverse=True)
         selected: list[tuple[int, float]] = []
+        selected_idx: set[int] = set()
         per_file_counts: dict[str, int] = {}
+
+        # Explicit file references in the query should always be represented.
+        if explicit_targets:
+            forced = self._collect_forced_target_matches(
+                explicit_targets=explicit_targets,
+                prefer_unseen=prefer_unseen,
+                agent_name=agent_name,
+                max_chunks_per_file=max_chunks_per_file,
+            )
+            for idx, score in forced:
+                fact = self._facts[idx]
+                source_path = str(fact.get("source_path", "")).strip() or str(fact.get("source_file", "unknown")).strip()
+                used = per_file_counts.get(source_path, 0)
+                if used >= max_chunks_per_file:
+                    continue
+                selected.append((idx, score))
+                selected_idx.add(idx)
+                per_file_counts[source_path] = used + 1
+                if len(selected) >= top_k:
+                    break
+
         for idx, score in scored:
+            if idx in selected_idx:
+                continue
             fact = self._facts[idx]
             source_path = str(fact.get("source_path", "")).strip() or str(fact.get("source_file", "unknown")).strip()
             used = per_file_counts.get(source_path, 0)
             if used >= max_chunks_per_file:
                 continue
             selected.append((idx, score))
+            selected_idx.add(idx)
             per_file_counts[source_path] = used + 1
             if len(selected) >= top_k:
                 break
@@ -152,6 +181,43 @@ class DatasetContextProvider:
         header = f"INGESTED CODEBASE KNOWLEDGE ({len(lines)} chunks from {self._dataset_name or 'uploaded files'})"
         return f"{header}:\n" + "\n".join(lines)
 
+    def _collect_forced_target_matches(
+        self,
+        *,
+        explicit_targets: list[str],
+        prefer_unseen: bool,
+        agent_name: str,
+        max_chunks_per_file: int,
+    ) -> list[tuple[int, float]]:
+        forced: list[tuple[int, float]] = []
+        seen_idx: set[int] = set()
+        for target in explicit_targets:
+            matches: list[tuple[int, float]] = []
+            for i, fact in enumerate(self._facts):
+                source_path = str(fact.get("source_path", "")).strip()
+                source_file = str(fact.get("source_file", "")).strip()
+                match_score = _single_target_match_score(target, source_path, source_file)
+                if match_score <= 0:
+                    continue
+                score = fact.get("tfidf_weight", 0.5) + match_score
+                if prefer_unseen and agent_name:
+                    seen = self._seen_indices.get(agent_name, set())
+                    if i not in seen:
+                        score *= 2.0
+                matches.append((i, score))
+
+            matches.sort(key=lambda item: item[1], reverse=True)
+            used_for_target = 0
+            for idx, score in matches:
+                if idx in seen_idx:
+                    continue
+                forced.append((idx, score + 100.0))
+                seen_idx.add(idx)
+                used_for_target += 1
+                if used_for_target >= max_chunks_per_file:
+                    break
+        return forced
+
     def get_summary(self) -> str:
         """Return a brief summary of what's in the dataset (for think phase)."""
         if not self._facts:
@@ -189,3 +255,65 @@ def _extract_query_keywords(text: str) -> set[str]:
     })
     tokens = re.findall(r"[A-Za-z_]{3,}", text.lower())
     return {t for t in tokens if t not in _STOP}
+
+
+def _extract_query_file_targets(text: str) -> list[str]:
+    """Extract file-like path mentions from user/agent queries."""
+    targets: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        norm = _normalize_path(raw)
+        if not norm or norm in seen:
+            return
+        if norm.startswith("http://") or norm.startswith("https://"):
+            return
+        suffix = Path(norm).suffix.lower()
+        if not suffix or len(suffix) > 11:
+            return
+        seen.add(norm)
+        targets.append(norm)
+
+    for raw in re.findall(r"(?:[A-Za-z]:)?[A-Za-z0-9_.\\/-]+[\\/][A-Za-z0-9_.\\/-]+", text):
+        add(raw)
+    for raw in re.findall(r"\b[A-Za-z0-9_.-]+\.[A-Za-z]{1,10}\b", text):
+        add(raw)
+
+    return targets
+
+
+def _normalize_path(value: str) -> str:
+    cleaned = value.strip().strip("`\"'[](){}<>")
+    cleaned = cleaned.replace("\\", "/")
+    cleaned = re.sub(r"/+", "/", cleaned)
+    if cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.lower()
+    return cleaned
+
+
+def _single_target_match_score(target: str, source_path: str, source_file: str) -> float:
+    target_norm = _normalize_path(target)
+    source_norm = _normalize_path(source_path or source_file)
+    source_file_norm = _normalize_path(source_file)
+    target_name = Path(target_norm).name
+
+    if not target_norm or not source_norm:
+        return 0.0
+    if source_norm == target_norm:
+        return 10.0
+    if source_norm.endswith(f"/{target_norm}"):
+        return 8.0
+    if source_file_norm and (source_file_norm == target_norm or source_file_norm == target_name):
+        return 7.0
+    if target_name and source_norm.endswith(f"/{target_name}"):
+        return 6.5
+    if target_name and Path(source_file_norm).stem == Path(target_name).stem:
+        return 2.0
+    return 0.0
+
+
+def _explicit_target_score(explicit_targets: list[str], source_path: str, source_file: str) -> float:
+    if not explicit_targets:
+        return 0.0
+    return max((_single_target_match_score(t, source_path, source_file) for t in explicit_targets), default=0.0)
