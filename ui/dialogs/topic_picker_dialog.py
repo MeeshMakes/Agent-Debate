@@ -52,6 +52,13 @@ from core.session_manager import get_session_manager, SessionMeta
 from ingestion.ingestion_agent import get_datasets_dir, list_global_datasets
 
 
+_CUSTOM_TOPIC_TITLES = {"custom topic", "custom debate"}
+
+
+def _is_custom_topic_title(title: str) -> bool:
+    return title.strip().lower() in _CUSTOM_TOPIC_TITLES
+
+
 # ─────────────────────────────────────────────
 def _tp_key(topic_title: str, tp_text: str) -> str:
     """Return a stable 12-char hex key for a topic+talking-point pair."""
@@ -1729,7 +1736,7 @@ class TopicPickerDialog(QDialog):
 
         fallback_idx = next(
             (i for i, entry in enumerate(self._card_entries)
-             if entry.get("kind") == "starter" and STARTER_TOPICS[int(entry.get("index", 0))].title == "Custom Debate"),
+             if entry.get("kind") == "starter" and _is_custom_topic_title(STARTER_TOPICS[int(entry.get("index", 0))].title)),
             0,
         )
         self._select_topic(fallback_idx)
@@ -1819,7 +1826,7 @@ class TopicPickerDialog(QDialog):
 
         starter_index = int(entry.get("index", 0))
         topic = STARTER_TOPICS[starter_index]
-        is_custom = topic.title == "Custom Debate"
+        is_custom = _is_custom_topic_title(topic.title)
 
         self._preset_title_lbl.setVisible(not is_custom)
         self._custom_mode_group.setVisible(is_custom)
@@ -2282,7 +2289,7 @@ class TopicPickerDialog(QDialog):
         is_custom = False
         if entry.get("kind") == "starter":
             topic = STARTER_TOPICS[int(entry.get("index", 0))]
-            is_custom = topic.title == "Custom Debate"
+            is_custom = _is_custom_topic_title(topic.title)
         else:
             is_custom = True
 
